@@ -1,0 +1,941 @@
+const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
+
+const state = {
+  accounts: [],
+  account: null,
+  folders: [],
+  folder: null,
+  messages: [],
+  selectedUid: null,
+  sidebarVisible: true,
+  online: true,
+};
+
+const $ = (id) => document.getElementById(id);
+
+function showError(msg) {
+  // Errors surface in the status line at the bottom of the folders column,
+  // not as a banner pushing content around.
+  showStatus(msg);
+}
+
+function guardTauri() {
+  if (invoke) return true;
+  showError(
+    "Tauri API unavailable — the UI was loaded outside the app runtime. " +
+      "Launch with: npm run tauri dev"
+  );
+  return false;
+}
+
+function fmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+/* ---------- folders ---------- */
+
+async function loadFolders() {
+  if (!state.account) return;
+  try {
+    const [folders, online] = await invoke("list_folders", { account: state.account.name });
+    state.folders = folders;
+    setOnlineStatus(online);
+    renderFolders();
+    // Auto-select INBOX on first load.
+    if (!state.folder) {
+      const inbox =
+        state.folders.find((f) => f.specialUse === null && /inbox/i.test(f.name)) ||
+        state.folders[0];
+      if (inbox) selectFolder(inbox.name);
+    }
+  } catch (e) {
+    setOnlineStatus(false);
+    showStatus(String(e));
+  }
+}
+
+function setOnlineStatus(online) {
+  const wasOffline = state.online === false;
+  state.online = online;
+  const label = $("account-label");
+  const base = state.account
+    ? `${state.account.name} — ${state.account.email}`
+    : "No accounts configured — use Accounts → Add account";
+  label.textContent = online ? base : `${base}  ·  ~offline`;
+  label.classList.toggle("offline", !online);
+
+  if (online) {
+    clearStatus();
+    stopOfflinePolling();
+  } else if (!wasOffline) {
+    // Just went offline: poll periodically so the indicator clears itself
+    // as soon as connectivity returns, without user action.
+    startOfflinePolling();
+  }
+}
+
+let offlineTimer = null;
+
+function startOfflinePolling() {
+  if (offlineTimer) return;
+  offlineTimer = setInterval(async () => {
+    if (!state.account || state.online) {
+      stopOfflinePolling();
+      return;
+    }
+    try {
+      const [folders, online] = await invoke("list_folders", {
+        account: state.account.name,
+      });
+      if (online) {
+        state.folders = folders;
+        setOnlineStatus(true);
+        renderFolders();
+      }
+    } catch (_) {
+      // Still offline; keep polling.
+    }
+  }, 15000);
+}
+
+function stopOfflinePolling() {
+  if (offlineTimer) {
+    clearInterval(offlineTimer);
+    offlineTimer = null;
+  }
+}
+
+// Native connectivity events from the OS: instant, zero-cost. The webview
+// fires these when the network interface state changes.
+function initConnectivityEvents() {
+  window.addEventListener("online", () => {
+    // OS says the interface is up; verify against the IMAP server right away
+    // (the interface can be up while the network is still unusable).
+    if (state.account) {
+      invoke("list_folders", { account: state.account.name })
+        .then(([folders, online]) => {
+          state.folders = folders;
+          setOnlineStatus(online);
+          renderFolders();
+        })
+        .catch(() => setOnlineStatus(false));
+    }
+  });
+  window.addEventListener("offline", () => setOnlineStatus(false));
+}
+
+/* ---------- status line (bottom of folders column) ---------- */
+
+function showStatus(msg) {
+  const el = $("status-line");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+function clearStatus() {
+  const el = $("status-line");
+  el.textContent = "";
+  el.classList.add("hidden");
+}
+
+function renderFolders() {
+  const ul = $("folder-list");
+  ul.innerHTML = "";
+  for (const f of state.folders) {
+    const li = document.createElement("li");
+    if (state.folder === f.name) li.classList.add("selected");
+
+    const label = document.createElement("span");
+    label.className = "folder-name";
+    label.textContent = f.name;
+    li.title = f.name;
+    li.appendChild(label);
+
+    if (f.unread > 0) {
+      const badge = document.createElement("span");
+      badge.className = "unread-badge";
+      badge.textContent = f.unread > 99 ? "99+" : String(f.unread);
+      li.appendChild(badge);
+    }
+
+    li.addEventListener("click", () => selectFolder(f.name));
+    ul.appendChild(li);
+  }
+}
+
+async function selectFolder(name) {
+  state.folder = name;
+  state.selectedUid = null;
+  renderFolders();
+  $("list-header").textContent = name;
+  renderPreviewEmpty();
+  await loadMessages();
+}
+
+/* ---------- message list ---------- */
+
+function showListLoading(text) {
+  const ul = $("message-list");
+  ul.innerHTML = "";
+  const li = document.createElement("li");
+  li.className = "loading-row";
+  const spinner = document.createElement("span");
+  spinner.className = "spinner";
+  const label = document.createElement("span");
+  label.textContent = text;
+  li.append(spinner, label);
+  ul.appendChild(li);
+}
+
+function hideListLoading() {
+  document
+    .querySelectorAll("#message-list .loading-row")
+    .forEach((el) => el.remove());
+}
+
+async function loadMessages() {
+  if (!state.account || !state.folder) return;
+  const folderAtStart = state.folder;
+  showListLoading(`Loading ${state.folder}…`);
+  state.messages = [];
+  let first = true;
+
+  const finish = () => {
+    hideListLoading();
+    renderMessages();
+  };
+
+  try {
+    // Channel must be created inside the try: a failure here previously
+    // swallowed the rejection and left the spinner up forever.
+    // Note: in the withGlobalTauri bundle, Channel is under core, not ipc.
+    const onBatch = new window.__TAURI__.core.Channel();
+    onBatch.onmessage = (batch) => {
+      // Ignore batches from a stale folder load.
+      if (state.folder !== folderAtStart) return;
+      if (first) {
+        first = false;
+        hideListLoading();
+      }
+      // Merge, dedup by uid (cached batch + server batch overlap), and keep
+      // the whole list sorted newest-first.
+      const byUid = new Map(state.messages.map((m) => [m.uid, m]));
+      for (const m of batch) byUid.set(m.uid, m);
+      state.messages = [...byUid.values()].sort(
+        (a, b) => (b.date || 0) - (a.date || 0)
+      );
+      renderMessages();
+    };
+
+    await invoke("list_messages", {
+      account: state.account.name,
+      folder: state.folder,
+      onBatch,
+    });
+    finish();
+  } catch (e) {
+    hideListLoading();
+    setOnlineStatus(false);
+    showError(String(e));
+  }
+}
+
+function renderMessages() {
+  const ul = $("message-list");
+  ul.innerHTML = "";
+  for (const m of state.messages) {
+    const li = document.createElement("li");
+    if (m.seen) li.classList.add("read");
+    else li.classList.add("unread");
+    if (m.uid === state.selectedUid) li.classList.add("selected");
+
+    const top = document.createElement("div");
+    top.className = "msg-top";
+    const from = document.createElement("span");
+    from.className = "msg-from";
+    from.textContent = m.from || "(unknown)";
+    const date = document.createElement("span");
+    date.className = "msg-date";
+    date.textContent = fmtDate(m.date);
+    top.append(from, date);
+
+    const subj = document.createElement("div");
+    subj.className = "msg-subject";
+    subj.textContent = (m.has_attachment ? "📎 " : "") + m.subject;
+
+    li.append(top, subj);
+    if (m.snippet) {
+      const snippet = document.createElement("div");
+      snippet.className = "msg-snippet";
+      snippet.textContent = m.snippet;
+      li.appendChild(snippet);
+    }
+
+    li.addEventListener("click", () => selectMessage(m.uid, li));
+    li.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, m.uid);
+    });
+    ul.appendChild(li);
+  }
+}
+
+/* ---------- mark as read / unread ---------- */
+
+let markReadTimer = null;
+
+async function setSeen(uid, seen) {
+  try {
+    await invoke("mark_message", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+      seen,
+    });
+    // Update local state + re-render without refetching from the server.
+    const msg = state.messages.find((m) => m.uid === uid);
+    if (msg) msg.seen = seen;
+    renderMessages();
+    refreshFolderUnread();
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+// Adjust the current folder's unread badge locally after a read/unread change.
+function refreshFolderUnread() {
+  const f = state.folders.find((x) => x.name === state.folder);
+  if (!f) return;
+  f.unread = state.messages.filter((m) => !m.seen).length;
+  renderFolders();
+}
+
+async function selectMessage(uid, li) {
+  state.selectedUid = uid;
+  document
+    .querySelectorAll("#message-list li")
+    .forEach((el) => el.classList.remove("selected"));
+  li.classList.add("selected");
+
+  // Keep selected for >=2s to mark as read.
+  clearTimeout(markReadTimer);
+  const msg = state.messages.find((m) => m.uid === uid);
+  if (msg && !msg.seen) {
+    markReadTimer = setTimeout(() => setSeen(uid, true), 2000);
+  }
+
+  try {
+    const body = await invoke("fetch_message", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+    });
+    renderPreview(body);
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+function showContextMenu(x, y, uid) {
+  let menu = document.getElementById("msg-context-menu");
+  if (!menu) {
+    menu = document.createElement("div");
+    menu.id = "msg-context-menu";
+    document.body.appendChild(menu);
+  }
+  const msg = state.messages.find((m) => m.uid === uid);
+  menu.innerHTML = "";
+
+  const items = [
+    {
+      label: msg && msg.seen ? "Mark as unread" : "Mark as read",
+      action: () => {
+        clearTimeout(markReadTimer);
+        setSeen(uid, !(msg && msg.seen));
+      },
+    },
+    { label: "Move to…", action: () => openMoveDialog(uid) },
+    { label: "Delete", danger: true, action: () => deleteMessage(uid) },
+  ];
+  for (const it of items) {
+    const el = document.createElement("div");
+    el.className = "menu-item" + (it.danger ? " danger" : "");
+    el.textContent = it.label;
+    el.addEventListener("click", () => {
+      menu.remove();
+      clearTimeout(markReadTimer);
+      it.action();
+    });
+    menu.appendChild(el);
+  }
+
+  menu.style.left = x + "px";
+  menu.style.top = y + "px";
+  menu.classList.add("open");
+
+  const close = (e) => {
+    if (!menu.contains(e.target)) {
+      menu.classList.remove("open");
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+    }
+  };
+  setTimeout(() => {
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+  }, 0);
+}
+
+/* ---------- move / delete ---------- */
+
+let moveTargetUid = null;
+
+function findTrashFolder() {
+  // Prefer the server-declared special-use, then a name match.
+  state.folders.find((f) => f.specialUse === "trash") ||
+    state.folders.find((f) => /trash|deleted/i.test(f.name));
+}
+
+async function deleteMessage(uid) {
+  const trash = findTrashFolder();
+  try {
+    await invoke("delete_message", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+      trashFolder: trash ? trash.name : null,
+    });
+    // Remove locally and clear the preview if it was showing this message.
+    state.messages = state.messages.filter((m) => m.uid !== uid);
+    renderMessages();
+    refreshFolderUnread();
+    if (state.selectedUid === uid) {
+      state.selectedUid = null;
+      renderPreviewEmpty();
+    }
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+function openMoveDialog(uid) {
+  moveTargetUid = uid;
+  const ul = $("move-folder-list");
+  ul.innerHTML = "";
+  for (const f of state.folders) {
+    if (f.name === state.folder) continue;
+    const li = document.createElement("li");
+    li.textContent = f.name;
+    li.addEventListener("click", async () => {
+      $("move-dialog").close();
+      await moveMessage(moveTargetUid, f.name);
+    });
+    ul.appendChild(li);
+  }
+  $("move-dialog").showModal();
+}
+
+async function moveMessage(uid, destFolder) {
+  try {
+    await invoke("move_message", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+      destFolder,
+    });
+    state.messages = state.messages.filter((m) => m.uid !== uid);
+    renderMessages();
+    refreshFolderUnread();
+    if (state.selectedUid === uid) {
+      state.selectedUid = null;
+      renderPreviewEmpty();
+    }
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+/* ---------- preview ---------- */
+
+function renderPreviewEmpty() {
+  $("preview-empty").classList.remove("hidden");
+  $("preview-content").classList.add("hidden");
+}
+
+function renderPreview(body) {
+  const summary = state.messages.find((m) => m.uid === body.uid) || {};
+  $("preview-empty").classList.add("hidden");
+  $("preview-content").classList.remove("hidden");
+  $("preview-subject").textContent = summary.subject || "(no subject)";
+  $("preview-meta").textContent = [
+    summary.from || "",
+    summary.date ? new Date(summary.date).toLocaleString() : "",
+  ]
+    .filter(Boolean)
+    .join("  ·  ");
+
+  // Render inside a fully sandboxed iframe (no scripts, no same-origin).
+  const frame = $("preview-frame");
+  const content = body.html ?? `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(body.text ?? "(empty message)")}</pre>`;
+  frame.srcdoc = content;
+
+  loadAttachmentList(body.uid);
+}
+
+async function loadAttachmentList(uid) {
+  const box = $("attachment-list");
+  box.innerHTML = "";
+  box.classList.add("hidden");
+  let atts = [];
+  try {
+    atts = await invoke("list_attachments", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+    });
+  } catch (_) {
+    return; // attachment listing is best-effort
+  }
+  if (!atts.length) return;
+
+  const header = document.createElement("div");
+  header.className = "att-header";
+  header.textContent = `${atts.length} attachment${atts.length > 1 ? "s" : ""}`;
+  box.appendChild(header);
+
+  for (const a of atts) {
+    const item = document.createElement("div");
+    item.className = "att-item";
+    const name = document.createElement("span");
+    name.className = "att-name";
+    name.textContent = a.filename;
+    const size = document.createElement("span");
+    size.className = "att-size";
+    size.textContent = fmtSize(a.size);
+    const btn = document.createElement("button");
+    btn.className = "att-save";
+    btn.textContent = "Save as…";
+    btn.addEventListener("click", () => saveAttachment(uid, a));
+    item.append(name, size, btn);
+    box.appendChild(item);
+  }
+  box.classList.remove("hidden");
+}
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function saveAttachment(uid, att) {
+  const path = await window.__TAURI__.dialog.save({
+    defaultPath: att.filename,
+  });
+  if (!path) return;
+  try {
+    await invoke("save_attachment", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+      partId: att.part_id,
+      destPath: path,
+    });
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+function escapeHtml(s) {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/* ---------- compose ---------- */
+
+function openCompose(replyTo) {
+  const dlg = $("compose-dialog");
+  $("compose-error").classList.add("hidden");
+  if (replyTo) {
+    $("compose-to").value = replyTo.from || "";
+    $("compose-subject").value = replyTo.subject.startsWith("Re:")
+      ? replyTo.subject
+      : "Re: " + replyTo.subject;
+    $("compose-body").value = `\n\n----- Original message -----\nFrom: ${replyTo.from}\nSubject: ${replyTo.subject}\n`;
+  } else {
+    $("compose-to").value = "";
+    $("compose-subject").value = "";
+    $("compose-body").value = "";
+  }
+  dlg.showModal();
+}
+
+async function sendCompose(e) {
+  e.preventDefault();
+  const to = $("compose-to").value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const btn = $("compose-send");
+  btn.disabled = true;
+  try {
+    await invoke("send_email", {
+      args: {
+        account: state.account.name,
+        to,
+        subject: $("compose-subject").value,
+        body: $("compose-body").value,
+      },
+    });
+    $("compose-dialog").close();
+  } catch (err) {
+    const box = $("compose-error");
+    box.textContent = String(err);
+    box.classList.remove("hidden");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- accounts ---------- */
+
+function renderAccountsMenu() {
+  const menu = $("accounts-menu");
+  menu.innerHTML = "";
+
+  for (const acc of state.accounts) {
+    const item = document.createElement("div");
+    item.className = "menu-item" + (state.account && state.account.name === acc.name ? " active" : "");
+    const label = document.createElement("span");
+    label.textContent = `${acc.name} (${acc.email})`;
+    item.appendChild(label);
+
+    const del = document.createElement("button");
+    del.className = "del";
+    del.textContent = "Delete";
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete account '${acc.name}'?`)) return;
+      try {
+        await invoke("delete_account", { account: acc.name });
+        await refreshAccounts(null);
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+    item.appendChild(del);
+
+    item.addEventListener("click", async () => {
+      menu.classList.add("hidden");
+      await switchAccount(acc.name);
+    });
+    menu.appendChild(item);
+  }
+
+  menu.appendChild(Object.assign(document.createElement("div"), { className: "menu-sep" }));
+
+  const add = document.createElement("div");
+  add.className = "menu-item";
+  add.textContent = "＋ Add account…";
+  add.addEventListener("click", () => {
+    menu.classList.add("hidden");
+    openAccountDialog();
+  });
+  menu.appendChild(add);
+}
+
+async function refreshAccounts(preferredName) {
+  state.accounts = await invoke("get_accounts");
+  const target =
+    (preferredName && state.accounts.find((a) => a.name === preferredName)) ||
+    (state.account && state.accounts.find((a) => a.name === state.account.name)) ||
+    state.accounts[0] ||
+    null;
+  state.account = target;
+  renderAccountsMenu();
+  updateAccountLabel();
+  renderEmptyStates();
+  await resetMailState();
+}
+
+function updateAccountLabel() {
+  $("account-label").textContent = state.account
+    ? `${state.account.name} — ${state.account.email}`
+    : "No accounts configured — use Accounts → Add account";
+}
+
+function renderEmptyStates() {
+  const hasAccounts = state.accounts.length > 0;
+  $("no-accounts").classList.toggle("hidden", hasAccounts);
+  if (!hasAccounts) {
+    $("preview-empty").classList.add("hidden");
+  }
+}
+
+async function switchAccount(name) {
+  const acc = state.accounts.find((a) => a.name === name);
+  if (!acc) return;
+  state.account = acc;
+  renderAccountsMenu();
+  updateAccountLabel();
+  renderEmptyStates();
+  await resetMailState();
+}
+
+async function resetMailState() {
+  state.folder = null;
+  state.folders = [];
+  state.messages = [];
+  state.selectedUid = null;
+  $("folder-list").innerHTML = "";
+  $("message-list").innerHTML = "";
+  $("list-header").textContent = "Messages";
+  renderPreviewEmpty();
+  // Only connect when there is a real, fully-configured account.
+  if (state.account && state.account.password) await loadFolders();
+}
+
+/* ---------- add-account dialog ---------- */
+
+function openAccountDialog() {
+  $("acc-error").classList.add("hidden");
+  $("account-form").reset();
+  $("acc-imap-port").value = 993;
+  $("acc-smtp-port").value = 465;
+  $("acc-starttls").checked = false;
+  $("account-dialog").showModal();
+}
+
+function accountFormError(msg) {
+  const box = $("acc-error");
+  box.textContent = msg;
+  box.classList.remove("hidden");
+}
+
+async function saveAccount(e) {
+  e.preventDefault();
+  const btn = $("acc-save");
+  btn.disabled = true;
+  btn.textContent = "Testing connection…";
+  const name = $("acc-name").value.trim();
+  try {
+    await invoke("add_account", {
+      account: {
+        name,
+        email: $("acc-email").value.trim(),
+        imapHost: $("acc-imap-host").value.trim(),
+        imapPort: Number($("acc-imap-port").value),
+        username: $("acc-username").value.trim(),
+        password: $("acc-password").value,
+        smtpHost: $("acc-smtp-host").value.trim(),
+        smtpPort: Number($("acc-smtp-port").value),
+        smtpUsername: $("acc-smtp-username").value.trim() || null,
+        smtpPassword: $("acc-smtp-password").value || null,
+        smtpStarttls: $("acc-starttls").checked,
+      },
+    });
+    $("account-dialog").close();
+    await refreshAccounts(name);
+  } catch (err) {
+    accountFormError(String(err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test & Save";
+  }
+}
+
+function toggleSidebar() {
+  const folders = $("folders");
+  const narrow = window.matchMedia("(max-width: 899px)").matches;
+
+  if (narrow) {
+    // Narrow mode: folders hidden by default. Toggling shows folders and
+    // hides the preview (folders + messages only).
+    state.sidebarVisible = !state.sidebarVisible;
+    folders.classList.toggle("hidden-col", !state.sidebarVisible);
+    document.body.classList.toggle("narrow-folders", state.sidebarVisible);
+  } else {
+    state.sidebarVisible = !state.sidebarVisible;
+    folders.classList.toggle("hidden-col", !state.sidebarVisible);
+    document.body.classList.remove("narrow-folders");
+  }
+}
+
+// Keep column visibility consistent when the window is resized.
+function syncResponsiveColumns() {
+  const narrow = window.matchMedia("(max-width: 899px)").matches;
+  if (!narrow) {
+    document.body.classList.remove("narrow-folders");
+    $("folders").classList.toggle("hidden-col", !state.sidebarVisible);
+  } else {
+    // Entering narrow mode: hide folders unless the user explicitly
+    // toggled them on; preview is hidden by CSS while folders are shown.
+    $("folders").classList.toggle("hidden-col", !state.sidebarVisible);
+    document.body.classList.toggle("narrow-folders", state.sidebarVisible);
+  }
+}
+
+/* ---------- column widths ---------- */
+
+const WIDTH_KEY = "sufi-col-widths";
+const DEFAULT_WIDTHS = { folders: 20, messages: 30 }; // preview gets the rest
+
+function loadWidths() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(WIDTH_KEY));
+    if (raw && typeof raw.folders === "number" && typeof raw.messages === "number") {
+      return raw;
+    }
+  } catch (_) {}
+  return { ...DEFAULT_WIDTHS };
+}
+
+function saveWidths(w) {
+  localStorage.setItem(WIDTH_KEY, JSON.stringify(w));
+}
+
+function applyWidths() {
+  const w = loadWidths();
+  $("folders").style.width = w.folders + "%";
+  $("message-list-pane").style.width = w.messages + "%";
+  // Preview takes the remaining space via flex:1.
+}
+
+function initResizers() {
+  const main = $("main");
+
+  for (const handle of document.querySelectorAll(".col-resizer")) {
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const target = handle.dataset.resize; // "folders" | "messages"
+      const el = target === "folders" ? $("folders") : $("message-list-pane");
+      if (el.classList.contains("hidden-col")) return;
+
+      handle.classList.add("dragging");
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+
+      const startX = e.clientX;
+      const startW = el.getBoundingClientRect().width;
+      const totalW = main.getBoundingClientRect().width;
+
+      const onMove = (ev) => {
+        let pct = ((startW + ev.clientX - startX) / totalW) * 100;
+        // Clamp: keep every column usable.
+        const minPct = target === "folders" ? 4 : 10;
+        const other = target === "folders"
+          ? loadWidths().messages
+          : loadWidths().folders;
+        pct = Math.max(minPct, Math.min(pct, 90 - other));
+        el.style.width = pct.toFixed(2) + "%";
+      };
+
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        handle.classList.remove("dragging");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+
+        const w = loadWidths();
+        w[target] = (el.getBoundingClientRect().width / main.getBoundingClientRect().width) * 100;
+        saveWidths(w);
+      };
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+  }
+
+  applyWidths();
+}
+
+/* ---------- font size ---------- */
+
+const FONT_KEY = "sufi-base-font";
+
+function applyFontSize(px) {
+  document.documentElement.style.setProperty("--base-font", px + "px");
+  localStorage.setItem(FONT_KEY, String(px));
+}
+
+function initFontSize() {
+  const saved = Number(localStorage.getItem(FONT_KEY)) || 14;
+  applyFontSize(saved);
+  $("font-inc").addEventListener("click", () => {
+    const cur = Number(localStorage.getItem(FONT_KEY)) || 14;
+    applyFontSize(Math.min(cur + 1, 22));
+  });
+  $("font-dec").addEventListener("click", () => {
+    const cur = Number(localStorage.getItem(FONT_KEY)) || 14;
+    applyFontSize(Math.max(cur - 1, 10));
+  });
+}
+
+function init() {
+  if (!guardTauri()) return;
+
+  initFontSize();
+  initResizers();
+  initConnectivityEvents();
+  syncResponsiveColumns();
+  window.addEventListener("resize", syncResponsiveColumns);
+
+  $("toggle-sidebar").addEventListener("click", toggleSidebar);
+  $("refresh-btn").addEventListener("click", loadMessages);
+  $("compose-btn").addEventListener("click", () => openCompose(null));
+  document.getElementById("compose-form").addEventListener("submit", sendCompose);
+  $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());
+  $("reply-btn").addEventListener("click", () => {
+    const m = state.messages.find((x) => x.uid === state.selectedUid);
+    if (m) openCompose(m);
+  });
+  $("delete-btn").addEventListener("click", () => {
+    if (state.selectedUid != null) deleteMessage(state.selectedUid);
+  });
+  $("move-btn").addEventListener("click", () => {
+    if (state.selectedUid != null) openMoveDialog(state.selectedUid);
+  });
+  $("move-cancel").addEventListener("click", () => $("move-dialog").close());
+
+  // Accounts menu
+  $("accounts-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    renderAccountsMenu();
+    $("accounts-menu").classList.toggle("hidden");
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#accounts-menu-wrap")) {
+      $("accounts-menu").classList.add("hidden");
+    }
+  });
+  $("account-form").addEventListener("submit", saveAccount);
+  $("acc-cancel").addEventListener("click", () => $("account-dialog").close());
+  $("empty-add-btn").addEventListener("click", openAccountDialog);
+  // Keep SMTP port sensible when toggling STARTTLS.
+  $("acc-starttls").addEventListener("change", (e) => {
+    $("acc-smtp-port").value = e.target.checked ? 587 : 465;
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.key === "b") toggleSidebar();
+    if (e.ctrlKey && e.key === "n") openCompose(null);
+  });
+
+  refreshAccounts(null)
+    .then(() => {
+      // First run with no accounts: open the add-account dialog right away.
+      if (state.accounts.length === 0) openAccountDialog();
+    })
+    .catch((err) => showError(String(err)));
+}
+
+init();

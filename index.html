@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sufi Email</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+
+      <div id="toolbar">
+        <button id="toggle-sidebar" title="Show/hide folders (Ctrl+B)">☰</button>
+        <div id="accounts-menu-wrap">
+          <button id="accounts-btn">Accounts ▾</button>
+          <div id="accounts-menu" class="hidden"></div>
+        </div>
+        <span id="account-label"></span>
+        <span class="spacer"></span>
+        <div id="font-controls">
+          <button id="font-dec" title="Decrease font size">A−</button>
+          <button id="font-inc" title="Increase font size">A+</button>
+        </div>
+        <button id="refresh-btn" title="Refresh">⟳ Refresh</button>
+        <button id="compose-btn" title="Compose (Ctrl+N)">✎ Compose</button>
+      </div>
+
+      <div id="main">
+        <aside id="folders" class="visible">
+          <div class="col-header">Folders</div>
+          <ul id="folder-list"></ul>
+          <div id="status-line" class="hidden"></div>
+        </aside>
+        <div class="col-resizer" data-resize="folders" title="Drag to resize"></div>
+
+        <section id="message-list-pane">
+          <div class="col-header" id="list-header">Messages</div>
+          <ul id="message-list"></ul>
+        </section>
+        <div class="col-resizer" data-resize="messages" title="Drag to resize"></div>
+
+        <section id="preview-pane">
+          <div id="preview-empty">Select a message to read it here.</div>
+          <div id="no-accounts" class="hidden">
+            <div class="no-accounts-card">
+              <h2>Welcome to Sufi Email</h2>
+              <p>No accounts are configured yet.</p>
+              <button id="empty-add-btn">＋ Add your first account</button>
+            </div>
+          </div>
+          <div id="preview-content" class="hidden">
+            <div id="preview-subject"></div>
+            <div id="preview-meta"></div>
+            <div id="preview-actions">
+              <button id="reply-btn">↩ Reply</button>
+              <button id="move-btn">→ Move</button>
+              <button id="delete-btn" class="danger">✕ Delete</button>
+            </div>
+            <div id="attachment-list" class="hidden"></div>
+            <iframe id="preview-frame" sandbox=""></iframe>
+          </div>
+        </section>
+      </div>
+
+      <dialog id="account-dialog">
+        <form id="account-form" method="dialog">
+          <h2>Add account</h2>
+          <div class="grid2">
+            <label>Name <input id="acc-name" type="text" placeholder="Personal" required /></label>
+            <label>Email address <input id="acc-email" type="email" placeholder="you@example.com" required /></label>
+          </div>
+
+          <h3>IMAP (receiving)</h3>
+          <div class="grid2">
+            <label>Server <input id="acc-imap-host" type="text" placeholder="imap.example.com" required /></label>
+            <label>Port <input id="acc-imap-port" type="number" value="993" min="1" max="65535" required /></label>
+          </div>
+          <div class="grid2">
+            <label>Username <input id="acc-username" type="text" autocomplete="off" required /></label>
+            <label>Password <input id="acc-password" type="password" autocomplete="new-password" required /></label>
+          </div>
+          <p class="hint">IMAP always uses SSL/TLS (implicit TLS, typically port 993).</p>
+
+          <h3>SMTP (sending)</h3>
+          <div class="grid2">
+            <label>Server <input id="acc-smtp-host" type="text" placeholder="smtp.example.com" required /></label>
+            <label>Port <input id="acc-smtp-port" type="number" value="465" min="1" max="65535" required /></label>
+          </div>
+          <label class="check">
+            <input id="acc-starttls" type="checkbox" />
+            Use STARTTLS instead of implicit TLS (typical for port 587)
+          </label>
+          <details id="smtp-advanced">
+            <summary>Different SMTP credentials (optional)</summary>
+            <div class="grid2">
+              <label>SMTP username <input id="acc-smtp-username" type="text" autocomplete="off" placeholder="same as IMAP username" /></label>
+              <label>SMTP password <input id="acc-smtp-password" type="password" autocomplete="new-password" placeholder="same as IMAP password" /></label>
+            </div>
+          </details>
+
+          <div id="acc-error" class="hidden"></div>
+          <div class="dialog-buttons">
+            <button type="button" id="acc-cancel">Cancel</button>
+            <button type="submit" id="acc-save">Test &amp; Save</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="move-dialog">
+        <form id="move-form" method="dialog">
+          <h2>Move message to…</h2>
+          <ul id="move-folder-list"></ul>
+          <div class="dialog-buttons">
+            <button type="button" id="move-cancel">Cancel</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="compose-dialog">
+        <form id="compose-form" method="dialog">
+          <h2>New message</h2>
+          <label>To <input id="compose-to" type="text" placeholder="a@b.com, c@d.com" required /></label>
+          <label>Subject <input id="compose-subject" type="text" required /></label>
+          <textarea id="compose-body" rows="12" placeholder="Write your message…"></textarea>
+          <div id="compose-error" class="hidden"></div>
+          <div class="dialog-buttons">
+            <button type="button" id="compose-cancel">Cancel</button>
+            <button type="submit" id="compose-send">Send</button>
+          </div>
+        </form>
+      </dialog>
+    </div>
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>
