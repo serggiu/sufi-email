@@ -108,41 +108,48 @@ async fn delete_account(
     Ok(())
 }
 
+/// Serve the cached folder list instantly; refresh from the server in the
+/// background and push the fresh list over the channel when it arrives.
 #[tauri::command]
 async fn list_folders(
     account: String,
+    on_refresh: tauri::ipc::Channel<(Vec<mail::Folder>, bool)>,
     state: State<'_, AppState>,
-) -> Result<(Vec<mail::Folder>, bool), String> {
+) -> Result<Vec<mail::Folder>, String> {
     let cfg = {
         let c = state.config.lock().unwrap();
         c.accounts.iter().find(|a| a.name == account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
 
-    // Serve the cached list first so the UI works offline.
+    // 1. Cached list, returned immediately (works offline).
     let cached = {
         let store = store::Store::open(&acc)?;
         store.load_folders()?
     };
 
-    // Then try to refresh from the server.
-    match mail::list_folders(&acc).await {
-        Ok(fresh) => {
-            if let Ok(mut store) = store::Store::open(&acc) {
-                let _ = store.store_folders(&fresh);
+    // 2. Server refresh in the background; UI gets the result via channel.
+    let acc2 = acc.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = match mail::list_folders(&acc2).await {
+            Ok(fresh) => {
+                if let Ok(mut store) = store::Store::open(&acc2) {
+                    let _ = store.store_folders(&fresh);
+                }
+                Ok(fresh)
             }
-            Ok((fresh, true))
-        }
-        Err(e) => {
-            if cached.is_empty() {
-                // Nothing cached either: surface the error.
+            Err(e) => {
+                log::warn!("folder refresh failed (offline?): {e}");
                 Err(e)
-            } else {
-                log::warn!("folder refresh failed, serving cache: {e}");
-                Ok((cached, false))
             }
-        }
-    }
+        };
+        let _ = on_refresh.send(match result {
+            Ok(fresh) => (fresh, true),
+            Err(_) => (Vec::new(), false),
+        });
+    });
+
+    Ok(cached)
 }
 
 #[tauri::command]
@@ -172,14 +179,32 @@ async fn list_messages(
     let acc2 = acc.clone();
     let folder2 = folder.clone();
     let store_channel = on_batch.clone();
-    let result = mail::list_messages_streamed(&acc, &folder, move |batch| {
-        if let Ok(mut s) = store::Store::open(&acc2) {
-            if let Err(e) = s.upsert_summaries(&folder2, &batch) {
-                log::warn!("cache upsert failed: {e}");
+    let acc3 = acc.clone();
+    let folder3 = folder.clone();
+    let result = mail::list_messages_streamed(
+        &acc,
+        &folder,
+        move |batch| {
+            if let Ok(mut s) = store::Store::open(&acc2) {
+                if let Err(e) = s.upsert_summaries(&folder2, &batch) {
+                    log::warn!("cache upsert failed: {e}");
+                }
             }
-        }
-        let _ = store_channel.send(batch);
-    })
+            let _ = store_channel.send(batch);
+        },
+        move |server_uids| {
+            // Remove cache rows for UIDs that vanished from the server.
+            if let Ok(mut s) = store::Store::open(&acc3) {
+                match s.remove_uids_not_in(&folder3, &server_uids) {
+                    Ok(n) if n > 0 => log::info!(
+                        "reconciled {folder3}: removed {n} stale cache row(s)"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("reconcile failed: {e}"),
+                }
+            }
+        },
+    )
     .await;
 
     // Report connectivity so the ~offline tag tracks the real state.
@@ -418,6 +443,23 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
     let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
+
+    // Backfill content hashes + remove duplicates in existing caches.
+    for acc in &config.accounts {
+        match store::Store::open(acc) {
+            Ok(mut s) => {
+                if let Err(e) = s.backfill_hashes() {
+                    log::warn!("hash backfill failed for {}: {e}", acc.email);
+                }
+            }
+            Err(e) => log::warn!("store open failed for {}: {e}", acc.email),
+        }
+        match store::dedupe_existing(acc) {
+            Ok(n) if n > 0 => log::info!("removed {n} duplicate message(s) from {}", acc.email),
+            Ok(_) => {}
+            Err(e) => log::warn!("dedupe failed for {}: {e}", acc.email),
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

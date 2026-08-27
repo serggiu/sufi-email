@@ -71,15 +71,17 @@ impl Store {
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_folder_uid
                  ON messages(folder, uid);
-             -- NOTE: no unique index on message_id. Some servers (mailbox.org
-             -- observed) return empty/identical Message-IDs for all messages,
-             -- which would make a unique constraint reject legitimate rows.
-             -- Dedup is by (folder, uid), which is authoritative per folder.
+             -- Dedup by content: survives UID changes (moves between folders
+             -- assign new UIDs). Computed as a hash of from+date+subject.
+             -- ALTER above adds the column to pre-existing DBs; new DBs get it
+             -- from the migration statement too (errors ignored there).
+             CREATE INDEX IF NOT EXISTS idx_messages_folder_hash
+                 ON messages(folder, content_hash);
              CREATE INDEX IF NOT EXISTS idx_messages_folder_date
                  ON messages(folder, date DESC);
              CREATE TABLE IF NOT EXISTS folders (
                  name        TEXT PRIMARY KEY,
-             	delimiter   TEXT,
+              	delimiter   TEXT,
                  special_use TEXT,
                  unread      INTEGER NOT NULL DEFAULT 0,
                  sort_order  INTEGER NOT NULL DEFAULT 0
@@ -98,6 +100,12 @@ impl Store {
 
     /// Insert or update summaries fetched from IMAP. Returns how many rows
     /// were newly inserted.
+    ///
+    /// Dedup strategy:
+    /// 1. (folder, uid) conflict → update in place (normal refresh).
+    /// 2. Same content (from+date+subject hash) already in this folder under
+    ///    a different uid → the message was moved (e.g. Trash → Inbox) and
+    ///    got a new UID. Update the existing row's uid instead of inserting.
     pub fn upsert_summaries(
         &mut self,
         folder: &str,
@@ -107,11 +115,45 @@ impl Store {
         let mut inserted = 0;
         for m in summaries {
             let date: Option<i64> = m.date.map(|d| d.timestamp());
+            let hash = content_hash(&m.from, date, &m.subject);
+
+            // Does this content already exist in the folder under another uid?
+            let existing: Option<u32> = tx
+                .query_row(
+                    "SELECT uid FROM messages WHERE folder = ?1 AND content_hash = ?2 AND uid != ?3 LIMIT 1",
+                    rusqlite::params![folder, hash, m.uid],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            if let Some(old_uid) = existing {
+                // Moved message: re-point the existing row to the new uid.
+                tx.execute(
+                    "UPDATE messages SET uid = ?1, seen = ?2, has_attachment = ?3,
+                        subject = ?4, from_name = ?5, from_email = ?6, date = ?7, snippet = ?8
+                     WHERE folder = ?9 AND uid = ?10",
+                    rusqlite::params![
+                        m.uid,
+                        m.seen as i64,
+                        m.has_attachment as i64,
+                        m.subject,
+                        from_name(&m.from),
+                        from_email(&m.from),
+                        date,
+                        m.snippet,
+                        folder,
+                        old_uid,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
+
             let n = tx
                 .execute(
-                    "INSERT INTO messages (folder, uid, subject, from_name, from_email,
-                                           date, seen, has_attachment, snippet)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "INSERT INTO messages (folder, uid, content_hash, subject, from_name,
+                                           from_email, date, seen, has_attachment, snippet)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(folder, uid) DO UPDATE SET
                         seen        = excluded.seen,
                         has_attachment = excluded.has_attachment,
@@ -119,10 +161,12 @@ impl Store {
                         from_name   = excluded.from_name,
                         from_email  = excluded.from_email,
                         date        = excluded.date,
-                        snippet     = excluded.snippet",
+                        snippet     = excluded.snippet,
+                        content_hash = excluded.content_hash",
                     rusqlite::params![
                         folder,
                         m.uid,
+                        hash,
                         m.subject,
                         from_name(&m.from),
                         from_email(&m.from),
@@ -270,6 +314,34 @@ impl Store {
         Ok(())
     }
 
+    /// Reconciliation: drop cached rows whose UIDs are no longer on the
+    /// server (messages deleted or moved away by any client).
+    pub fn remove_uids_not_in(
+        &mut self,
+        folder: &str,
+        server_uids: &std::collections::HashSet<u32>,
+    ) -> Result<usize, String> {
+        let stale: Vec<u32> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT uid FROM messages WHERE folder = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([folder], |r| r.get::<_, u32>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let mut removed = 0;
+        for uid in stale {
+            if !server_uids.contains(&uid) {
+                self.delete_message(folder, uid)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Update only the seen flag locally (after a successful STORE on IMAP).
     pub fn set_seen(&mut self, folder: &str, uid: u32, seen: bool) -> Result<(), String> {
         self.conn
@@ -341,6 +413,92 @@ fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+/// Stable content identity for dedup: hash of from + date + subject.
+/// We avoid server Message-IDs because some servers (mailbox.org observed)
+/// return empty/identical values for every message.
+///
+/// NOTE: this intentionally does NOT include the body — the summary is all
+/// we have at upsert time, and from+date+subject is unique enough in
+/// practice (two genuinely identical mails from the same sender at the same
+/// second with the same subject are vanishingly rare).
+fn content_hash(from: &str, date: Option<i64>, subject: &str) -> String {
+    use sha2::Digest;
+    use std::fmt::Write as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(from.as_bytes());
+    hasher.update(b"\x1f"); // unit separator
+    hasher.update(date.unwrap_or(0).to_le_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(subject.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// One-time cleanup: remove rows that are duplicates of another row in the
+/// same folder by content hash (keeps the lowest uid = oldest copy).
+/// Needed to clean up caches created before content-hash dedup existed.
+pub fn dedupe_existing(acc: &AccountConfig) -> Result<usize, String> {
+    let store = Store::open(acc)?;
+    let n = store
+        .conn
+        .execute(
+            "DELETE FROM messages WHERE rowid_pk NOT IN (
+                 SELECT MIN(rowid_pk) FROM messages GROUP BY folder, content_hash
+             )",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+impl Store {
+    /// Backfill content_hash for rows created before hashing existed.
+    pub fn backfill_hashes(&mut self) -> Result<usize, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid_pk, COALESCE(from_name,''), COALESCE(from_email,''), date, COALESCE(subject,'') FROM messages WHERE content_hash = ''")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String, String, Option<i64>, String)> =
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        drop(stmt);
+
+        let mut updated = 0;
+        for (rowid, fname, femail, date, subject) in rows {
+            let from = if fname.is_empty() {
+                femail.clone()
+            } else if femail.is_empty() {
+                fname.clone()
+            } else {
+                format!("{fname} <{femail}>")
+            };
+            let hash = content_hash(&from, date, &subject);
+            self.conn
+                .execute(
+                    "UPDATE messages SET content_hash = ?1 WHERE rowid_pk = ?2",
+                    rusqlite::params![hash, rowid],
+                )
+                .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
 }
 
 fn from_name(from: &str) -> &str {

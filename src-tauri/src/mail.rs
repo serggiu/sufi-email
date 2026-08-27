@@ -359,6 +359,7 @@ pub async fn list_messages_streamed(
     acc: &AccountConfig,
     folder: &str,
     on_batch: impl Fn(Vec<MessageSummary>) + Send + 'static,
+    on_reconcile: impl Fn(std::collections::HashSet<u32>) + Send + 'static,
 ) -> Result<(), String> {
     const CHUNK: u32 = 25;
     const MAX: u32 = 200;
@@ -403,6 +404,14 @@ pub async fn list_messages_streamed(
             }
             top = bottom.saturating_sub(1);
         }
+
+        // Reconcile: drop cached rows whose UIDs no longer exist on the
+        // server (messages deleted or moved away by any client).
+        let server_uids = session
+            .uid_search("ALL")
+            .map_err(|e| format!("UID SEARCH failed: {e}"))?;
+        on_reconcile(server_uids);
+
         Ok(())
     })
     .await

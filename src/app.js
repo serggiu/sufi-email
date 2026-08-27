@@ -43,22 +43,38 @@ function fmtDate(iso) {
 async function loadFolders() {
   if (!state.account) return;
   try {
-    const [folders, online] = await invoke("list_folders", { account: state.account.name });
-    state.folders = folders;
-    setOnlineStatus(online);
-    renderFolders();
-    // Auto-select INBOX on first load.
-    if (!state.folder) {
-      const inbox =
-        state.folders.find((f) => f.specialUse === null && /inbox/i.test(f.name)) ||
-        state.folders[0];
-      if (inbox) selectFolder(inbox.name);
+    // Returns the cached list immediately; the server refresh arrives later
+    // on the channel (or never, if offline).
+    const cached = await invoke("list_folders", {
+      account: state.account.name,
+      onRefresh: folderRefreshChannel,
+    });
+    if (cached.length > 0) {
+      state.folders = cached;
+      renderFolders();
+      // Auto-select INBOX on first load.
+      if (!state.folder) {
+        const inbox =
+          state.folders.find((f) => f.specialUse === null && /inbox/i.test(f.name)) ||
+          state.folders[0];
+        if (inbox) selectFolder(inbox.name);
+      }
     }
   } catch (e) {
     setOnlineStatus(false);
     showStatus(String(e));
   }
 }
+
+// Receives (folders, online) when the background server refresh completes.
+const folderRefreshChannel = new window.__TAURI__.core.Channel();
+folderRefreshChannel.onmessage = ([folders, online]) => {
+  if (folders.length > 0) {
+    state.folders = folders;
+    renderFolders();
+  }
+  setOnlineStatus(online);
+};
 
 function setOnlineStatus(online) {
   const wasOffline = state.online === false;
@@ -880,6 +896,45 @@ function initFontSize() {
   });
 }
 
+/* ---------- auto-refresh ---------- */
+
+const REFRESH_KEY = "sufi-refresh-minutes";
+let autoRefreshTimer = null;
+
+function getRefreshMinutes() {
+  const v = Number(localStorage.getItem(REFRESH_KEY));
+  return Number.isFinite(v) && v > 0 ? v : 0; // 0 = off
+}
+
+function renderRefreshMenu() {
+  const current = getRefreshMinutes();
+  document.querySelectorAll("#refresh-menu .menu-item").forEach((el) => {
+    el.classList.toggle("active", Number(el.dataset.minutes) === current);
+  });
+}
+
+function setRefreshMinutes(minutes) {
+  localStorage.setItem(REFRESH_KEY, String(minutes));
+  scheduleAutoRefresh();
+  renderRefreshMenu();
+}
+
+function scheduleAutoRefresh() {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+  const minutes = getRefreshMinutes();
+  if (minutes > 0) {
+    autoRefreshTimer = setInterval(() => {
+      // Only auto-fetch when online; the offline poller handles recovery.
+      if (state.online && state.account && state.folder) {
+        loadMessages();
+      }
+    }, minutes * 60 * 1000);
+  }
+}
+
 function init() {
   if (!guardTauri()) return;
 
@@ -891,6 +946,25 @@ function init() {
 
   $("toggle-sidebar").addEventListener("click", toggleSidebar);
   $("refresh-btn").addEventListener("click", loadMessages);
+
+  // Refresh split-button: arrow opens the interval menu.
+  $("refresh-arrow").addEventListener("click", (e) => {
+    e.stopPropagation();
+    renderRefreshMenu();
+    $("refresh-menu").classList.toggle("hidden");
+  });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#refresh-wrap")) {
+      $("refresh-menu").classList.add("hidden");
+    }
+  });
+  document.querySelectorAll("#refresh-menu .menu-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      setRefreshMinutes(Number(el.dataset.minutes));
+      $("refresh-menu").classList.add("hidden");
+    });
+  });
+  scheduleAutoRefresh();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   document.getElementById("compose-form").addEventListener("submit", sendCompose);
   $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());

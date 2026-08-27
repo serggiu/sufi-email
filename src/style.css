@@ -368,6 +368,38 @@ li.read .msg-snippet { opacity: 0.7; }
 #attachment-list .att-size { color: var(--text-dim); font-size: 12px; flex-shrink: 0; }
 #attachment-list .att-save { flex-shrink: 0; }
 
+/* ---- refresh split button ---- */
+#refresh-wrap { position: relative; display: flex; }
+#refresh-btn { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+#refresh-arrow {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid var(--border);
+  padding: 5px 7px;
+  font-size: 10px;
+}
+#refresh-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  min-width: 170px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  z-index: 50;
+  padding: 4px;
+}
+#refresh-menu .menu-item {
+  padding: 7px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+}
+#refresh-menu .menu-item:hover { background: var(--bg-hover); }
+#refresh-menu .menu-item.active { color: var(--accent); }
+
 /* ---- font size control ---- */
 #font-controls { display: flex; gap: 4px; }
 #font-controls button {

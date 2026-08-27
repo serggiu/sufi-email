@@ -21,7 +21,16 @@
           <button id="font-dec" title="Decrease font size">A−</button>
           <button id="font-inc" title="Increase font size">A+</button>
         </div>
-        <button id="refresh-btn" title="Refresh">⟳ Refresh</button>
+        <div id="refresh-wrap">
+          <button id="refresh-btn" title="Refresh now">⟳ Refresh</button>
+          <button id="refresh-arrow" title="Auto-refresh interval">▾</button>
+          <div id="refresh-menu" class="hidden">
+            <div class="menu-item" data-minutes="0">Off</div>
+            <div class="menu-item" data-minutes="1">Every 1 minute</div>
+            <div class="menu-item" data-minutes="5">Every 5 minutes</div>
+            <div class="menu-item" data-minutes="15">Every 15 minutes</div>
+          </div>
+        </div>
         <button id="compose-btn" title="Compose (Ctrl+N)">✎ Compose</button>
       </div>
 
