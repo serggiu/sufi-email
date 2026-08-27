@@ -23,10 +23,13 @@ fn secret_path() -> PathBuf {
     crate::account::Config::dir().join(SECRET_FILE)
 }
 
-/// Load (or create) the machine-local secret and return a Cocoon cipher.
-fn cocoon() -> Result<Cocoon<'static, cocoon::Creation>, String> {
+/// Load (or create) the machine-local secret.
+///
+/// Re-read from disk on every call: keeps the key fresh if the file changes
+/// (the crypto tests swap it deliberately) and costs a 32-byte read.
+fn load_secret() -> Result<[u8; SECRET_LEN], String> {
     let path = secret_path();
-    let secret: [u8; SECRET_LEN] = match fs::read(&path) {
+    Ok(match fs::read(&path) {
         Ok(bytes) if bytes.len() == SECRET_LEN => bytes
             .try_into()
             .expect("length checked above"),
@@ -54,16 +57,23 @@ fn cocoon() -> Result<Cocoon<'static, cocoon::Creation>, String> {
             }
             key
         }
-    };
-    // The stored secret is already 32 bytes of CSPRNG output, so we skip
-    // the extra KDF pass (Cocoon's default PBKDF2 targets human passwords).
-    let leaked: &'static [u8] = Box::leak(secret.to_vec().into_boxed_slice());
-    Ok(Cocoon::new(leaked))
+    })
+}
+
+/// The stored secret is already 32 bytes of CSPRNG output (256 bits of
+/// entropy), so PBKDF2's cost buys nothing — its sole purpose is to slow
+/// down brute-force of LOW-entropy passwords. Cocoon's default runs
+/// 100_000 iterations (~1.8s per seal/unseal in debug builds); the weak
+/// variant uses 10_000. Old containers store their own iteration count
+/// in the header and stay readable either way.
+fn new_cocoon(secret: &[u8]) -> Cocoon<'_, cocoon::Creation> {
+    Cocoon::new(secret).with_weak_kdf()
 }
 
 /// Encrypt a password; returns base64 ciphertext to store in the config.
 pub fn seal_password(plain: &str) -> Result<String, String> {
-    let mut cocoon = cocoon()?;
+    let secret = load_secret()?;
+    let mut cocoon = new_cocoon(&secret);
     let sealed = cocoon
         .wrap(plain.as_bytes())
         .map_err(|e| format!("seal password: {e:?}"))?;
@@ -72,7 +82,8 @@ pub fn seal_password(plain: &str) -> Result<String, String> {
 
 /// Decrypt a password previously sealed by [`seal_password`].
 pub fn unseal_password(sealed_b64: &str) -> Result<String, String> {
-    let cocoon = cocoon()?;
+    let secret = load_secret()?;
+    let cocoon = new_cocoon(&secret);
     let data = base64_decode(sealed_b64)?;
     let plain = cocoon
         .unwrap(&data)

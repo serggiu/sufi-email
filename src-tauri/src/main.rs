@@ -2,11 +2,20 @@
 
 mod account;
 mod crypto;
+#[cfg(test)]
+mod fake_imap;
 mod mail;
 mod store;
+#[cfg(test)]
+mod account_tests;
+#[cfg(test)]
+mod imap_integration_tests;
+#[cfg(test)]
+mod crypto_tests;
+#[cfg(test)]
+mod store_tests;
 
-use account::{AccountConfig, Config};
-use std::fs;
+use account::{AccountConfig, AccountInfo, Config};
 use std::sync::Mutex;
 use tauri::State;
 
@@ -14,9 +23,17 @@ pub struct AppState {
     pub config: Mutex<Config>,
 }
 
+/// Accounts for the UI — a sanitized view without the sealed passwords.
 #[tauri::command]
-fn get_accounts(state: State<AppState>) -> Vec<AccountConfig> {
-    state.config.lock().unwrap().accounts.clone()
+fn get_accounts(state: State<AppState>) -> Vec<AccountInfo> {
+    state
+        .config
+        .lock()
+        .unwrap()
+        .accounts
+        .iter()
+        .map(AccountInfo::from)
+        .collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -434,14 +451,33 @@ async fn save_attachment(
     .await
     .map_err(|e| format!("join error: {e}"))??;
 
-    let mut file = fs::File::create(&dest_path).map_err(|e| format!("create {}: {e}", dest_path))?;
+    let mut file = open_private_file(&dest_path)
+        .map_err(|e| format!("create {}: {e}", dest_path))?;
     file.write_all(&data).map_err(|e| format!("write: {e}"))?;
     Ok(())
 }
 
+/// Open a file for writing with owner-only permissions (0o600), so saved
+/// message attachments aren't world-readable by default.
+fn open_private_file(path: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    let mut config = Config::load_or_default();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();    let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
 
     // Backfill content hashes + remove duplicates in existing caches.
@@ -482,4 +518,22 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod main_tests {
+    #[test]
+    fn open_private_file_creates_owner_only_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("saved-attachment.bin");
+        let file = super::open_private_file(path.to_str().unwrap()).expect("create file");
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "saved attachments must be owner-only");
+        }
+    }
 }

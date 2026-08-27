@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Build the standalone desktop application.
+#
+# Runs the full Tauri build: frontend (vite) + release Rust binary, then
+# produces the distributable bundles (AppImage/deb on Linux; icons come
+# from src-tauri/tauri.linux.conf.json). The standalone binary lands in
+# src-tauri/target/release/sufi-email.
+#
+# Usage:
+#   bin/build                  # standard release build + bundles
+#   bin/build --no-bundle      # build the release binary without bundling
+#   bin/build --bundles deb    # only the deb package
+#   bin/build -- --no-bundle   # a leading "--" is accepted and stripped
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The tauri CLI ships as an npm devDependency (@tauri-apps/cli).
+if [ ! -x "$ROOT/node_modules/.bin/tauri" ]; then
+  echo "error: tauri CLI not found — run 'npm install' in $ROOT first" >&2
+  exit 1
+fi
+
+# Strip a single leading "--" (a habit from passing args to cargo test).
+ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--" ] && [ ${#ARGS[@]} -eq 0 ]; then
+    continue
+  fi
+  ARGS+=("$a")
+done
+
+echo "==> Building standalone app: npm run tauri build ${ARGS[*]}"
+cd "$ROOT"
+exec npm run tauri build "${ARGS[@]}"

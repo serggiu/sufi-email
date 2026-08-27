@@ -98,6 +98,34 @@ function setOnlineStatus(online) {
 
 let offlineTimer = null;
 
+// Re-check connectivity against the IMAP server and apply the outcome.
+// Uses the same channel flow as loadFolders: the (folders, online) verdict
+// arrives on the channel — the invoke return value is only the cached list.
+async function probeConnectivity() {
+  if (!state.account) return;
+  const channel = new window.__TAURI__.core.Channel();
+  channel.onmessage = ([folders, online]) => {
+    if (folders.length > 0) {
+      state.folders = folders;
+      renderFolders();
+    }
+    setOnlineStatus(online);
+  };
+  try {
+    const cached = await invoke("list_folders", {
+      account: state.account.name,
+      onRefresh: channel,
+    });
+    if (cached.length > 0) {
+      state.folders = cached;
+      renderFolders();
+    }
+  } catch (_) {
+    // Server unreachable; keep the offline tag.
+    setOnlineStatus(false);
+  }
+}
+
 function startOfflinePolling() {
   if (offlineTimer) return;
   offlineTimer = setInterval(async () => {
@@ -105,18 +133,7 @@ function startOfflinePolling() {
       stopOfflinePolling();
       return;
     }
-    try {
-      const [folders, online] = await invoke("list_folders", {
-        account: state.account.name,
-      });
-      if (online) {
-        state.folders = folders;
-        setOnlineStatus(true);
-        renderFolders();
-      }
-    } catch (_) {
-      // Still offline; keep polling.
-    }
+    await probeConnectivity();
   }, 15000);
 }
 
@@ -133,15 +150,7 @@ function initConnectivityEvents() {
   window.addEventListener("online", () => {
     // OS says the interface is up; verify against the IMAP server right away
     // (the interface can be up while the network is still unusable).
-    if (state.account) {
-      invoke("list_folders", { account: state.account.name })
-        .then(([folders, online]) => {
-          state.folders = folders;
-          setOnlineStatus(online);
-          renderFolders();
-        })
-        .catch(() => setOnlineStatus(false));
-    }
+    probeConnectivity();
   });
   window.addEventListener("offline", () => setOnlineStatus(false));
 }
@@ -414,8 +423,10 @@ let moveTargetUid = null;
 
 function findTrashFolder() {
   // Prefer the server-declared special-use, then a name match.
-  state.folders.find((f) => f.specialUse === "trash") ||
-    state.folders.find((f) => /trash|deleted/i.test(f.name));
+  return (
+    state.folders.find((f) => f.specialUse === "trash") ||
+    state.folders.find((f) => /trash|deleted/i.test(f.name))
+  );
 }
 
 async function deleteMessage(uid) {
@@ -497,11 +508,29 @@ function renderPreview(body) {
     .join("  ·  ");
 
   // Render inside a fully sandboxed iframe (no scripts, no same-origin).
+  // A CSP meta tag additionally blocks remote resources — most importantly
+  // remote images, so tracking pixels in HTML mail cannot phone home.
   const frame = $("preview-frame");
-  const content = body.html ?? `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(body.text ?? "(empty message)")}</pre>`;
-  frame.srcdoc = content;
+  const content =
+    body.html ??
+    `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(
+      body.text ?? "(empty message)"
+    )}</pre>`;
+  frame.srcdoc = withEmailCsp(content);
 
   loadAttachmentList(body.uid);
+}
+
+// Allow only embedded (data:) images and inline styles; everything else —
+// remote images, web fonts, scripts, frames — is blocked.
+function withEmailCsp(html) {
+  const meta =
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'">';
+  const head = /<head[^>]*>/i.exec(html);
+  if (head) {
+    return html.slice(0, head.index + head[0].length) + meta + html.slice(head.index + head[0].length);
+  }
+  return meta + html;
 }
 
 async function loadAttachmentList(uid) {
@@ -716,7 +745,7 @@ async function resetMailState() {
   $("list-header").textContent = "Messages";
   renderPreviewEmpty();
   // Only connect when there is a real, fully-configured account.
-  if (state.account && state.account.password) await loadFolders();
+  if (state.account && state.account.hasPassword) await loadFolders();
 }
 
 /* ---------- add-account dialog ---------- */

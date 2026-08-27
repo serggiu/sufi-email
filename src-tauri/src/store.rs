@@ -36,6 +36,15 @@ impl Store {
         crate::account::Config::dir().join("storage")
     }
 
+    /// Open (or create) a store in an explicit directory. Used by tests to
+    /// keep databases isolated from the user's real cache.
+    #[cfg(test)]
+    pub fn open_in(dir: &std::path::Path, email: &str) -> Result<Store, String> {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.db", sanitize(email)));
+        Self::init_connection(Connection::open(&path).map_err(|e| e.to_string())?, &path)
+    }
+
     fn db_path(acc: &AccountConfig) -> PathBuf {
         // Keyed by email, not display name: names change, addresses don't.
         Self::dir().join(format!("{}.db", sanitize(&acc.email)))
@@ -46,11 +55,15 @@ impl Store {
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = Self::db_path(acc);
         let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+        Self::init_connection(conn, &path)
+    }
+
+    fn init_connection(conn: Connection, path: &std::path::Path) -> Result<Store, String> {
         // 0600: the mail cache belongs to the user alone.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -59,6 +72,7 @@ impl Store {
                  folder     TEXT    NOT NULL,
                  uid        INTEGER NOT NULL,
                  message_id TEXT    NOT NULL DEFAULT '',
+                 content_hash TEXT NOT NULL DEFAULT '',
                  subject    TEXT,
                  from_name  TEXT,
                  from_email TEXT,
@@ -73,8 +87,6 @@ impl Store {
                  ON messages(folder, uid);
              -- Dedup by content: survives UID changes (moves between folders
              -- assign new UIDs). Computed as a hash of from+date+subject.
-             -- ALTER above adds the column to pre-existing DBs; new DBs get it
-             -- from the migration statement too (errors ignored there).
              CREATE INDEX IF NOT EXISTS idx_messages_folder_hash
                  ON messages(folder, content_hash);
              CREATE INDEX IF NOT EXISTS idx_messages_folder_date
@@ -95,17 +107,16 @@ impl Store {
              );",
         )
         .map_err(|e| e.to_string())?;
+        // Migration for databases created before content_hash existed.
+        // Errors are ignored: the common case is "column already exists".
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+        );
         Ok(Store { conn })
     }
 
     /// Insert or update summaries fetched from IMAP. Returns how many rows
     /// were newly inserted.
-    ///
-    /// Dedup strategy:
-    /// 1. (folder, uid) conflict → update in place (normal refresh).
-    /// 2. Same content (from+date+subject hash) already in this folder under
-    ///    a different uid → the message was moved (e.g. Trash → Inbox) and
-    ///    got a new UID. Update the existing row's uid instead of inserting.
     pub fn upsert_summaries(
         &mut self,
         folder: &str,
@@ -415,6 +426,12 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
+/// Test-only accessor for the sanitizer.
+#[cfg(test)]
+pub(crate) fn sanitize_for_test(name: &str) -> String {
+    sanitize(name)
+}
+
 /// Stable content identity for dedup: hash of from + date + subject.
 /// We avoid server Message-IDs because some servers (mailbox.org observed)
 /// return empty/identical values for every message.
@@ -438,6 +455,12 @@ fn content_hash(from: &str, date: Option<i64>, subject: &str) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     hex
+}
+
+/// Test-only accessor.
+#[cfg(test)]
+pub(crate) fn content_hash_for_test(from: &str, date: Option<i64>, subject: &str) -> String {
+    content_hash(from, date, subject)
 }
 
 /// One-time cleanup: remove rows that are duplicates of another row in the

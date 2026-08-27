@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Run all existing tests for the Sufi Email project.
+#
+# All current tests are Rust unit + integration tests in src-tauri
+# (config/crypto/store units + the fake-IMAP integration suite).
+# Frontend tests do not exist yet; when they are added (e.g. vitest),
+# extend this script to run them here.
+#
+# Usage:
+#   bin/test                 # run everything
+#   bin/test <filter>        # run only matching tests (cargo test filter)
+#   bin/test -- --nocapture  # pass extra args through to cargo test
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+echo "==> Running Rust tests (src-tauri): cargo test $*"
+cd "$ROOT/src-tauri"
+exec cargo test "$@"

@@ -44,6 +44,43 @@ pub struct Config {
     pub accounts: Vec<AccountConfig>,
 }
 
+/// Non-secret view of an account, sent to the frontend.
+///
+/// The sealed passwords never cross the IPC boundary: the UI only needs to
+/// know whether an account is fully configured, not the ciphertext itself.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfo {
+    pub name: String,
+    pub email: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub username: String,
+    /// true when the account has a password sealed on disk.
+    pub has_password: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: Option<String>,
+    pub smtp_starttls: bool,
+}
+
+impl From<&AccountConfig> for AccountInfo {
+    fn from(a: &AccountConfig) -> Self {
+        AccountInfo {
+            name: a.name.clone(),
+            email: a.email.clone(),
+            imap_host: a.imap_host.clone(),
+            imap_port: a.imap_port,
+            username: a.username.clone(),
+            has_password: !a.password.is_empty(),
+            smtp_host: a.smtp_host.clone(),
+            smtp_port: a.smtp_port,
+            smtp_username: a.smtp_username.clone(),
+            smtp_starttls: a.smtp_starttls,
+        }
+    }
+}
+
 /// Heuristic: sealed passwords are base64 (no spaces/quotes/'@' etc.) and
 /// unsealable. A plaintext password that happens to be valid base64 of a
 /// valid cocoon container is astronomically unlikely.
@@ -62,7 +99,12 @@ impl Config {
         Self::dir().join("config.toml")
     }
 
+    /// Config directory. Tests can override it via the SUFI_EMAIL_CONFIG_DIR
+    /// env var so they never touch the user's real configuration.
     pub fn dir() -> PathBuf {
+        if let Ok(override_dir) = std::env::var("SUFI_EMAIL_CONFIG_DIR") {
+            return PathBuf::from(override_dir);
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("sufi-email")
@@ -138,6 +180,14 @@ impl Config {
         let text =
             toml::to_string_pretty(self).map_err(|e| format!("serialize config: {e}"))?;
         fs::write(&path, text).map_err(|e| e.to_string())?;
+        // 0600: the config holds mail server addresses/usernames and sealed
+        // passwords; only the owner should be able to read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 }

@@ -40,10 +40,48 @@ fn imap_session(
 ) -> Result<imap::Session<Box<dyn imap::ImapConnection>>, String> {
     let password = crypto::unseal_password(&acc.password)?;
     let client = imap::ClientBuilder::new(&acc.imap_host, acc.imap_port)
+        .mode(session_connection_mode(&acc.imap_host))
         .connect()
         .map_err(|e| format!("IMAP connect to {}:{} failed: {e}", acc.imap_host, acc.imap_port))?;
     let session = client
         .login(&acc.username, &password)
+        .map_err(|e| e.0.to_string())?;
+    Ok(session)
+}
+
+/// Production always uses TLS (implicit on 993, STARTTLS elsewhere).
+#[cfg(not(test))]
+fn session_connection_mode(_host: &str) -> imap::ConnectionMode {
+    imap::ConnectionMode::AutoTls
+}
+
+/// Tests run against the in-process fake IMAP server on 127.0.0.1, which
+/// speaks plaintext TCP only; any other host keeps the production TLS path.
+#[cfg(test)]
+fn session_connection_mode(host: &str) -> imap::ConnectionMode {
+    if host == "127.0.0.1" || host == "localhost" {
+        imap::ConnectionMode::Plaintext
+    } else {
+        imap::ConnectionMode::AutoTls
+    }
+}
+
+/// Open a session against a plaintext (non-TLS) server. Used by tests with
+/// the fake IMAP server; production always uses TLS via `imap_session`.
+/// Returns the session with a boxed connection, matching production types.
+#[cfg(test)]
+pub fn imap_session_insecure(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> Result<imap::Session<Box<dyn imap::ImapConnection>>, String> {
+    let client = imap::ClientBuilder::new(host, port)
+        .mode(imap::ConnectionMode::Plaintext)
+        .connect()
+        .map_err(|e| format!("connect to {host}:{port} failed: {e}"))?;
+    let session = client
+        .login(username, password)
         .map_err(|e| e.0.to_string())?;
     Ok(session)
 }
@@ -257,6 +295,127 @@ fn truncate_chars(s: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    // ---- html_to_plain ----
+
+    #[test]
+    fn html_tags_are_stripped() {
+        // Tags emit spaces (word separators); callers collapse whitespace
+        // afterwards, so raw output may contain doubled spaces.
+        assert_eq!(html_to_plain("<p>Hello</p>"), " Hello ");
+        assert_eq!(collapse_whitespace(&html_to_plain("<b>bold</b> text")), "bold text");
+    }
+
+    #[test]
+    fn html_block_tags_become_word_separators() {
+        let out = html_to_plain("line1<br>line2");
+        assert!(out.contains("line1") && out.contains("line2"));
+        assert_ne!(out, "line1line2");
+    }
+
+    #[test]
+    fn common_entities_are_decoded() {
+        assert_eq!(html_to_plain("a &amp; b"), "a & b");
+        assert_eq!(html_to_plain("&lt;tag&gt;"), "<tag>");
+        assert_eq!(html_to_plain("&quot;quoted&quot;"), "\"quoted\"");
+        assert_eq!(html_to_plain("a&nbsp;b"), "a b");
+        assert_eq!(html_to_plain("&#65;&#x42;"), "AB");
+    }
+
+    #[test]
+    fn literal_less_than_is_preserved() {
+        // "a < b" is not a tag: the char after '<' is a space.
+        assert_eq!(html_to_plain("a < b"), "a < b");
+    }
+
+    #[test]
+    fn unknown_entities_pass_through() {
+        assert_eq!(html_to_plain("&nosuch;"), "&nosuch;");
+    }
+
+    #[test]
+    fn utf8_survives_html_stripping() {
+        assert_eq!(html_to_plain("<p>DacÄ ai pÄstrat</p>"), " DacÄ ai pÄstrat ");
+    }
+
+    // ---- collapse_whitespace ----
+
+    #[test]
+    fn whitespace_runs_collapse_to_single_space() {
+        assert_eq!(collapse_whitespace("a \t\n  b"), "a b");
+        assert_eq!(collapse_whitespace("  trimmed  "), "trimmed");
+    }
+
+    // ---- truncate_chars ----
+
+    #[test]
+    fn short_strings_are_untouched() {
+        assert_eq!(truncate_chars("short", 300), "short");
+    }
+
+    #[test]
+    fn long_strings_are_truncated_with_ellipsis() {
+        let s = "x".repeat(400);
+        let out = truncate_chars(&s, 300);
+        assert_eq!(out.chars().count(), 301); // 300 + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // Multi-byte characters must not be cut mid-sequence.
+        let s = "ä".repeat(400);
+        let out = truncate_chars(&s, 300);
+        assert!(out.starts_with(&"ä".repeat(300)));
+        assert!(out.ends_with('…'));
+    }
+
+    // ---- special_use_of ----
+
+    #[test]
+    fn special_use_flags_are_recognized() {
+        assert_eq!(special_use_of(&["\\Trash".to_string()]).as_deref(), Some("trash"));
+        assert_eq!(special_use_of(&["\\Sent".to_string()]).as_deref(), Some("sent"));
+        assert_eq!(special_use_of(&["\\Junk".to_string()]).as_deref(), Some("junk"));
+        assert_eq!(special_use_of(&["\\Archive".to_string()]).as_deref(), Some("archive"));
+        assert_eq!(special_use_of(&["\\Drafts".to_string()]).as_deref(), Some("drafts"));
+    }
+
+    #[test]
+    fn no_special_use_flag_returns_none() {
+        assert_eq!(special_use_of(&[]), None);
+        assert_eq!(special_use_of(&["\\HasChildren".to_string()]), None);
+    }
+
+    // ---- content_hash (store.rs, tested here for convenience) ----
+
+    #[test]
+    fn content_hash_is_stable_for_identical_content() {
+        let a = crate::store::content_hash_for_test("a@b.com", Some(123), "Subject");
+        let b = crate::store::content_hash_for_test("a@b.com", Some(123), "Subject");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_hash_differs_for_different_content() {
+        let base = crate::store::content_hash_for_test("a@b.com", Some(123), "Subject");
+        assert_ne!(base, crate::store::content_hash_for_test("other@b.com", Some(123), "Subject"));
+        assert_ne!(base, crate::store::content_hash_for_test("a@b.com", Some(456), "Subject"));
+        assert_ne!(base, crate::store::content_hash_for_test("a@b.com", Some(123), "Other"));
+    }
+
+    #[test]
+    fn content_hash_handles_missing_date() {
+        let with_none = crate::store::content_hash_for_test("a@b.com", None, "S");
+        let with_zero = crate::store::content_hash_for_test("a@b.com", Some(0), "S");
+        // None and Some(0) hash the same (both map to 0) - documented behavior.
+        assert_eq!(with_none, with_zero);
+    }
+}
+
 /// Build a summary from a single fetched message. `raw` is the full RFC 822
 /// message; mail-parser decodes RFC 2047 headers, charsets and transfer
 /// encodings, then light cleanup strips any residual HTML.
@@ -375,6 +534,13 @@ pub async fn list_messages_streamed(
         let exists = mailbox.exists;
         if exists == 0 {
             log::debug!("streaming {folder}: empty mailbox");
+            // No summaries to stream, but the local cache may still hold rows
+            // for messages that were removed server-side. Reconcile with the
+            // (empty) server uid set so stale cache rows are pruned.
+            let server_uids = session
+                .uid_search("ALL")
+                .map_err(|e| format!("UID SEARCH failed: {e}"))?;
+            on_reconcile(server_uids);
             return Ok(());
         }
 
