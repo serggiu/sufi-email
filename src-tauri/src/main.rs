@@ -257,7 +257,7 @@ async fn list_messages(
     let result = mail::list_messages_streamed(
         &acc,
         &folder,
-        move |batch, bodies| {
+        move |mut batch, bodies| {
             if let Ok(mut s) = store::Store::open(&acc2) {
                 if let Err(e) = s.upsert_summaries(&folder2, &batch) {
                     log::warn!("cache upsert failed: {e}");
@@ -267,6 +267,16 @@ async fn list_messages(
                 // listed message a cache hit.
                 if let Err(e) = s.store_bodies(&folder2, &bodies) {
                     log::warn!("body cache write failed: {e}");
+                }
+                // Apply locally-pending seen states to the outgoing batch so
+                // the UI doesn't flash a just-marked message back to unread
+                // while the server STORE is still in flight.
+                if let Ok(pending) = s.pending_seen_map(&folder2) {
+                    for m in batch.iter_mut() {
+                        if let Some(seen) = pending.get(&m.uid) {
+                            m.seen = *seen;
+                        }
+                    }
                 }
             }
             let _ = store_channel.send(batch);
@@ -341,6 +351,10 @@ async fn mark_message(
     // marks it read locally, and the change is queued for the server.
     let mut store = store::Store::open(&acc)?;
     store.set_seen(&folder, uid, seen)?;
+    // Record the change as pending BEFORE the server call: a list refresh
+    // during the SMTP/IMAP round trip would otherwise overwrite it with
+    // the server's still-stale flag and flash the message back to unread.
+    store.upsert_pending_flag(&folder, uid, seen)?;
 
     match mail::set_seen(&acc, &folder, uid, seen).await {
         Ok(server_unread) => {

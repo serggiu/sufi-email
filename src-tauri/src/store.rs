@@ -148,9 +148,15 @@ impl Store {
         folder: &str,
         summaries: &[crate::mail::MessageSummary],
     ) -> Result<usize, String> {
+        // Read/unread changes that the server hasn't confirmed yet (an
+        // in-flight optimistic mark, or an offline queued one). Their value
+        // wins over the server's flags so a list refresh can't flash a
+        // message back to stale unread while the STORE is still in flight.
+        let pending = self.pending_seen_map(folder)?;
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let mut inserted = 0;
         for m in summaries {
+            let seen = pending.get(&m.uid).copied().unwrap_or(m.seen);
             let date: Option<i64> = m.date.map(|d| d.timestamp());
             let hash = content_hash(&m.from, date, &m.subject);
 
@@ -171,7 +177,7 @@ impl Store {
                      WHERE folder = ?9 AND uid = ?10",
                     rusqlite::params![
                         m.uid,
-                        m.seen as i64,
+                        seen as i64,
                         m.has_attachment as i64,
                         m.subject,
                         from_name(&m.from),
@@ -208,7 +214,7 @@ impl Store {
                         from_name(&m.from),
                         from_email(&m.from),
                         date,
-                        m.seen as i64,
+                        seen as i64,
                         m.has_attachment as i64,
                         m.snippet,
                     ],
@@ -601,6 +607,18 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>()
             .map(|v| v.into_iter().map(|(f, u, s)| (f, u as u32, s)).collect())
             .map_err(|e| e.to_string())
+    }
+
+    /// Pending (not-yet-server-confirmed) seen values for one folder, keyed
+    /// by UID. These override the server's flags on refresh so an in-flight
+    /// or offline mark isn't clobbered by stale server state.
+    pub fn pending_seen_map(&self, folder: &str) -> Result<std::collections::HashMap<u32, bool>, String> {
+        Ok(self
+            .pending_flags()?
+            .into_iter()
+            .filter(|(f, _, _)| f == folder)
+            .map(|(_, uid, seen)| (uid, seen))
+            .collect())
     }
 
     /// Drop pending flags for messages that no longer exist on the server

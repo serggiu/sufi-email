@@ -468,12 +468,12 @@ async function selectMessage(uid, li) {
     .forEach((el) => el.classList.remove("selected"));
   li.classList.add("selected");
 
-  // Keep selected for >=1.3s to mark as read. While offline the backend
+  // Keep selected for >=0.7s to mark as read. While offline the backend
   // applies the change locally and queues it for the server.
   clearTimeout(markReadTimer);
   const msg = state.messages.find((m) => m.uid === uid);
   if (msg && !msg.seen) {
-    markReadTimer = setTimeout(() => setSeen(uid, true), 1300);
+    markReadTimer = setTimeout(() => setSeen(uid, true), 700);
   }
 
   try {

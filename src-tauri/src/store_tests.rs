@@ -497,3 +497,36 @@ fn pending_flags_purged_for_vanished_uids() {
     let pending = store.pending_flags().unwrap();
     assert_eq!(pending, vec![("INBOX".into(), 2, true), ("Archive".into(), 2, true)]);
 }
+
+#[test]
+fn upsert_respects_pending_seen_override() {
+    let (_dir, mut store) = test_store("pending-override");
+    // In-flight optimistic mark: seen=true pending, server still says unread.
+    store.upsert_pending_flag("INBOX", 1, true).unwrap();
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    let loaded = store.load_summaries("INBOX").unwrap();
+    assert!(loaded[0].seen, "pending read wins over stale server unread");
+
+    // Once the server confirms, the pending entry is gone and the server
+    // flag applies again.
+    store.remove_pending_flag("INBOX", 1).unwrap();
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    let loaded = store.load_summaries("INBOX").unwrap();
+    assert!(!loaded[0].seen, "server value applies once pending is cleared");
+}
+
+#[test]
+fn pending_seen_map_returns_only_folder_flags() {
+    let (_dir, mut store) = test_store("pending-map");
+    store.upsert_pending_flag("INBOX", 1, true).unwrap();
+    store.upsert_pending_flag("INBOX", 2, false).unwrap();
+    store.upsert_pending_flag("Archive", 3, true).unwrap();
+    let map = store.pending_seen_map("INBOX").unwrap();
+    assert_eq!(map.get(&1), Some(&true));
+    assert_eq!(map.get(&2), Some(&false));
+    assert!(!map.contains_key(&3));
+}
