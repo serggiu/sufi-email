@@ -109,6 +109,50 @@ pub fn list_folder_uids(acc: &AccountConfig, folder: &str) -> Result<Vec<u32>, S
     Ok(uids)
 }
 
+/// Sender display + subject of one message, from the ENVELOPE on an already
+/// open session — used to build the new-mail notification without doing a
+/// full folder sync.
+pub fn fetch_envelope_preview(
+    session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
+    uid: u32,
+) -> Result<(String, String), String> {
+    let fetches = session
+        .uid_fetch(format!("{uid}"), "(ENVELOPE)")
+        .map_err(|e| format!("FETCH failed: {e}"))?;
+    let f = fetches
+        .iter()
+        .next()
+        .ok_or_else(|| format!("message uid {uid} not found"))?;
+    let env = f.envelope().ok_or("no envelope")?;
+    let from = env
+        .from
+        .as_ref()
+        .and_then(|l| l.first())
+        .map(address_display)
+        .unwrap_or_default();
+    let subject = env
+        .subject
+        .as_ref()
+        .map(|s| collapse_whitespace(&html_to_plain(&decode_imap_utf8(s))))
+        .unwrap_or_default();
+    Ok((from, subject))
+}
+
+fn address_display(a: &imap_proto::types::Address) -> String {
+    let name = a.name.as_ref().map(|n| String::from_utf8_lossy(n).into_owned());
+    let email = a
+        .mailbox
+        .as_ref()
+        .zip(a.host.as_ref())
+        .map(|(m, h)| format!("{}@{}", String::from_utf8_lossy(m), String::from_utf8_lossy(h)));
+    match (name, email) {
+        (Some(n), Some(e)) if !n.is_empty() => format!("{n} <{e}>"),
+        (Some(n), _) => n,
+        (_, Some(e)) => e,
+        _ => String::new(),
+    }
+}
+
 /// Verify IMAP credentials by logging in and immediately logging out.
 pub async fn test_imap(acc: &AccountConfig) -> Result<(), String> {
     let acc = acc.clone();
@@ -559,18 +603,19 @@ fn summarize(f: &imap::types::Fetch) -> Option<(MessageSummary, BatchBody)> {
 
 /// Stream message summaries to the UI in batches of ~25 (newest first) as
 /// they are fetched, instead of one blocking round-trip.
-pub async fn list_messages_streamed(
+/// Blocking core of [`list_messages_streamed`], usable from worker threads
+/// (the background IDLE watcher's cache warm-up) that have no async runtime.
+pub fn list_messages_streamed_blocking(
     acc: &AccountConfig,
     folder: &str,
-    on_batch: impl Fn(Vec<MessageSummary>, Vec<BatchBody>) + Send + 'static,
-    on_reconcile: impl Fn(std::collections::HashSet<u32>) + Send + 'static,
+    on_batch: impl Fn(Vec<MessageSummary>, Vec<BatchBody>),
+    on_reconcile: impl Fn(std::collections::HashSet<u32>),
 ) -> Result<(), String> {
     const CHUNK: u32 = 25;
     const MAX: u32 = 200;
 
     let acc = acc.clone();
     let folder = folder.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
         let mut session = imap_session(&acc)?;
         // SELECT returns the mailbox info including EXISTS - no STATUS needed.
         let mailbox = session
@@ -626,7 +671,21 @@ pub async fn list_messages_streamed(
             .map_err(|e| format!("UID SEARCH failed: {e}"))?;
         on_reconcile(server_uids);
 
-        Ok(())
+    Ok(())
+}
+
+/// Stream message summaries to the UI in batches of ~25 (newest first) as
+/// they are fetched, instead of one blocking round-trip.
+pub async fn list_messages_streamed(
+    acc: &AccountConfig,
+    folder: &str,
+    on_batch: impl Fn(Vec<MessageSummary>, Vec<BatchBody>) + Send + 'static,
+    on_reconcile: impl Fn(std::collections::HashSet<u32>) + Send + 'static,
+) -> Result<(), String> {
+    let acc = acc.clone();
+    let folder = folder.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_messages_streamed_blocking(&acc, &folder, on_batch, on_reconcile)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?

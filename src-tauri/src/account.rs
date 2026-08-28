@@ -42,15 +42,6 @@ pub struct AccountConfig {
 pub struct Config {
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
-    /// Minutes between background polls for new-mail notifications and
-    /// UI refreshes. The frontend's refresh menu (Off/1/5/15) writes this;
-    /// the default when the user hasn't chosen is 1 minute. 0 = off.
-    #[serde(default = "default_refresh_interval")]
-    pub refresh_interval_minutes: u64,
-}
-
-fn default_refresh_interval() -> u64 {
-    1
 }
 
 /// Non-secret view of an account, sent to the frontend.

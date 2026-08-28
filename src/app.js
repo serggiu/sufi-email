@@ -94,6 +94,12 @@ function setOnlineStatus(online) {
   if (online) {
     clearStatus();
     stopOfflinePolling();
+    // Coming back online: refresh the visible folder (badges + list) —
+    // with no interval poller, this is the recovery refresh.
+    if (wasOffline && state.account) {
+      loadFolders();
+      if (state.folder) loadMessages();
+    }
   } else if (!wasOffline) {
     // Just went offline: poll periodically so the indicator clears itself
     // as soon as connectivity returns, without user action.
@@ -1057,42 +1063,16 @@ function initFontSize() {
   });
 }
 
-/* ---------- auto-refresh ---------- */
-
-// The auto-refresh interval lives in the backend config so the background
-// inbox poller and the UI share it: the poller checks for new mail on this
-// cadence, fires the notification, and emits `mail-refresh` — which is what
-// drives the list/folder refresh here (see initMailRefreshListener). There
-// is no separate frontend timer; notification and list refresh always
-// happen in the same cycle.
-let refreshMinutes = 1; // matches the backend default; hydrated at startup
-
-async function renderRefreshMenu() {
-  if (invoke) {
-    try {
-      refreshMinutes = Number(await invoke("get_refresh_interval"));
-    } catch (_) {}
-  }
-  document.querySelectorAll("#refresh-menu .menu-item").forEach((el) => {
-    el.classList.toggle("active", Number(el.dataset.minutes) === refreshMinutes);
-  });
+// Refresh folders + the visible message list. Triggered by the manual
+// Refresh button and by `mail-refresh` events from the background IDLE
+// watchers (instant new-mail detection). The offline flag guards against
+// spamming errors while disconnected (the offline poller handles recovery).
+function refreshMail() {
+  if (!state.online || !state.account) return;
+  loadFolders();
+  if (state.folder) loadMessages();
 }
 
-async function setRefreshMinutes(minutes) {
-  if (!invoke) return;
-  try {
-    await invoke("set_refresh_interval", { minutes: Number(minutes) });
-    refreshMinutes = Number(minutes);
-  } catch (e) {
-    showError(String(e));
-  }
-  renderRefreshMenu();
-}
-
-// Refresh folders + the visible message list on every poller tick. The
-// poller runs on the same interval as this UI, so the list stays in step
-// with the notifications; the offline flag guards against spamming errors
-// while disconnected (the offline poller handles recovery).
 function initMailRefreshListener() {
   if (!window.__TAURI__ || !window.__TAURI__.event) return;
   window.__TAURI__.event.listen("mail-refresh", () => {
@@ -1112,25 +1092,9 @@ function init() {
   window.addEventListener("resize", syncResponsiveColumns);
 
   $("toggle-sidebar").addEventListener("click", toggleSidebar);
-  $("refresh-btn").addEventListener("click", loadMessages);
+  // Full manual refresh: folders (badges) + the visible message list.
+  $("refresh-btn").addEventListener("click", refreshMail);
 
-  // Refresh split-button: arrow opens the interval menu.
-  $("refresh-arrow").addEventListener("click", (e) => {
-    e.stopPropagation();
-    renderRefreshMenu();
-    $("refresh-menu").classList.toggle("hidden");
-  });
-  document.addEventListener("click", (e) => {
-    if (!e.target.closest("#refresh-wrap")) {
-      $("refresh-menu").classList.add("hidden");
-    }
-  });
-  document.querySelectorAll("#refresh-menu .menu-item").forEach((el) => {
-    el.addEventListener("click", () => {
-      setRefreshMinutes(Number(el.dataset.minutes));
-      $("refresh-menu").classList.add("hidden");
-    });
-  });
   initMailRefreshListener();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   document.getElementById("compose-form").addEventListener("submit", sendCompose);

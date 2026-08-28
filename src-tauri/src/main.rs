@@ -24,18 +24,37 @@ use tauri::State;
 
 pub struct AppState {
     pub config: Mutex<Config>,
+    /// Accounts that currently have a live IDLE watcher thread. Used to
+    /// avoid spawning duplicate watchers when new accounts are added at
+    /// runtime.
+    pub idle_watched: Mutex<std::collections::HashSet<String>>,
 }
 
-/// Fire the silent "new mail" toast through the OS notification daemon.
+/// Fire the silent new-mail toast through the OS notification daemon.
 /// Visual only: no sound hint is set (the freedesktop spec is silent by
 /// default; `.silent()` makes that explicit on platforms that support it).
-fn notify_new_mail(app: &tauri::AppHandle) {
+/// Shows the sender and subject when available; `extra` is the number of
+/// additional new messages beyond the one described.
+fn fire_new_mail_notification(app: &tauri::AppHandle, from: &str, subject: &str, extra: usize) {
     use tauri_plugin_notification::NotificationExt;
+    let title = if from.is_empty() {
+        "New email".to_string()
+    } else {
+        format!("New email from {from}")
+    };
+    let mut body = if subject.is_empty() {
+        "You have a new email.".to_string()
+    } else {
+        subject.to_string()
+    };
+    if extra > 0 {
+        body.push_str(&format!("  (+{extra} more)"));
+    }
     if let Err(e) = app
         .notification()
         .builder()
-        .title("New email")
-        .body("You have a new email.")
+        .title(title)
+        .body(body)
         .silent()
         .show()
     {
@@ -105,6 +124,7 @@ impl From<NewAccount> for AccountConfig {
 #[tauri::command]
 async fn add_account(
     account: NewAccount,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let acc: AccountConfig = account.into();
@@ -119,7 +139,11 @@ async fn add_account(
     cfg.accounts.push(acc);
     let result = cfg.save();
     drop(cfg);
-    result
+    result?;
+
+    // Give the new account its own background watcher right away.
+    spawn_missing_idle_watchers(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -280,7 +304,10 @@ async fn list_messages(
                 match s.new_uids_since_last_sync(&folder, &server_uids) {
                     Ok(new) if !new.is_empty() => {
                         log::info!("{}: {} new message(s), notifying", folder, new.len());
-                        notify_new_mail(&app);
+                        // The stream just upserted the summaries, so the
+                        // sender/subject come from the cache.
+                        let (from, subject, extra) = cached_preview(&acc, &folder, &new);
+                        fire_new_mail_notification(&app, &from, &subject, extra);
                     }
                     Ok(_) => {}
                     Err(e) => log::warn!("new-mail check failed: {e}"),
@@ -618,105 +645,228 @@ fn inbox_folder_name(acc: &AccountConfig) -> Option<String> {
 /// One poll cycle: check every account's inbox for new mail and notify.
 /// Runs on the poller thread; never touches the UI directly. Emits
 /// `mail-refresh` afterwards so the frontend reloads folders + messages in
-/// the same cycle as any notification.
-fn poll_inboxes(app: &tauri::AppHandle) {
-    let st = app.state::<AppState>();
-    let accounts = st.config.lock().unwrap().accounts.clone();
-    let mut connected = false;
-    if !accounts.is_empty() {
-        for acc in accounts {
-            let Some(inbox) = inbox_folder_name(&acc) else {
-                continue;
-            };
-            match mail::list_folder_uids(&acc, &inbox) {
-                Ok(uids) => {
-                    connected = true;
-                    if let Ok(mut s) = store::Store::open(&acc) {
-                        match s.new_uids_since_last_sync(&inbox, &uids) {
-                            Ok(new) if !new.is_empty() => {
-                                log::info!(
-                                    "inbox poll: {} new message(s) for {} ({inbox})",
-                                    new.len(),
-                                    acc.email
-                                );
-                                notify_new_mail(app);
-                            }
-                            Ok(_) => {}
-                            Err(e) => log::warn!("inbox poll: new-mail check failed: {e}"),
-                        }
-                    }
-                }
-                Err(e) => log::warn!("inbox poll failed for {}: {e}", acc.email),
-            }
+/// Diff the server UID set against what we've already notified about and
+/// return the genuinely-new UIDs (recording them so they won't re-fire).
+fn diff_new_uids(acc: &AccountConfig, inbox: &str, uids: &[u32]) -> Vec<u32> {
+    match store::Store::open(acc).and_then(|mut s| s.new_uids_since_last_sync(inbox, uids)) {
+        Ok(new) => new,
+        Err(e) => {
+            log::warn!("new-mail check failed for {}: {e}", acc.email);
+            Vec::new()
         }
     }
-    // We just proved connectivity: push any offline flag changes to the
-    // server (read/unread made while disconnected) BEFORE telling the UI
-    // to refresh, so the refreshed badges reflect the synced flags.
-    if connected {
-        flush_pending_flags(app);
-    }
-
-    // Tell the UI to refresh regardless of whether anything was new — this
-    // is the app's auto-refresh pulse (unread badges, message list, offline
-    // state all ride on it). The frontend only acts when it is online.
-    let _ = app.emit("mail-refresh", ());
 }
 
-/// Background INBOX poller — the single refresh driver for the whole app.
-/// Every `refresh_interval_minutes` (config, default 1, 0 = off) it checks
-/// every account's inbox for new mail and fires a silent notification when
-/// new mail arrives; after each cycle it emits a `mail-refresh` event so the
-/// frontend reloads folders + the visible message list in the same tick —
-/// the notification and the list refresh are therefore always in sync, and
-/// the UI auto-refresh and the background poll share one interval.
-///
-/// A short tick with elapsed-time bookkeeping (rather than sleeping the
-/// whole interval) means interval changes in config.toml — including 0 →
-/// on — take effect within seconds instead of at the next long sleep.
-fn spawn_inbox_poller(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn_blocking(move || {
-        use std::time::Instant;
-        // First poll ~5 s after startup, then on the configured cadence.
-        let mut last_poll = Instant::now() - Duration::from_secs(55);
-        let mut last_interval: Option<u64> = None;
-        loop {
-            let st = app.state::<AppState>();
-            let minutes = st.config.lock().unwrap().refresh_interval_minutes;
-            drop(st);
-            let interval = minutes.min(24 * 60);
-            if interval != last_interval.unwrap_or(interval) {
-                log::info!("refresh interval set to {interval} minute(s)");
-                last_interval = Some(interval);
-            }
-            if interval > 0 && last_poll.elapsed() >= Duration::from_secs(interval * 60) {
-                last_poll = Instant::now();
-                poll_inboxes(&app);
-            }
-            std::thread::sleep(Duration::from_secs(5));
+/// Sender display + subject of the newest of `new_uids`, read from the
+/// local cache (used by the slow-poll fallback, which has no live session).
+fn cached_preview(acc: &AccountConfig, inbox: &str, new_uids: &[u32]) -> (String, String, usize) {
+    let Ok(store) = store::Store::open(acc) else {
+        return (String::new(), String::new(), 0);
+    };
+    let Ok(all) = store.load_summaries(inbox) else {
+        return (String::new(), String::new(), 0);
+    };
+    let set: std::collections::HashSet<u32> = new_uids.iter().copied().collect();
+    let mut hits: Vec<&crate::mail::MessageSummary> =
+        all.iter().filter(|m| set.contains(&m.uid)).collect();
+    hits.sort_by(|a, b| b.uid.cmp(&a.uid));
+    match hits.first() {
+        Some(m) => (m.from.clone(), m.subject.clone(), hits.len().saturating_sub(1)),
+        None => (String::new(), String::new(), 0),
+    }
+}
+
+/// Spawn one IDLE watcher thread per account that doesn't have one yet.
+/// Called at startup and periodically (accounts can be added at runtime).
+fn spawn_missing_idle_watchers(app: &tauri::AppHandle) {
+    let st = app.state::<AppState>();
+    let accounts = st.config.lock().unwrap().accounts.clone();
+    let mut watched = st.idle_watched.lock().unwrap();
+    for acc in &accounts {
+        if watched.insert(acc.name.clone()) {
+            let app2 = app.clone();
+            let acc2 = acc.clone();
+            log::info!("starting IDLE watcher for {}", acc.email);
+            tauri::async_runtime::spawn_blocking(move || {
+                idle_watch_account(&app2, &acc2);
+            });
         }
-    });
+    }
+}
+
+/// Result of one IDLE connection attempt.
+enum IdleOutcome {
+    /// The server does not advertise IDLE; fall back to slow polling.
+    NoIdle,
+}
+
+/// Per-account background watcher: prefers the RFC 2177 IDLE push (one
+/// dormant connection per account, instant new-mail notification with no
+/// polling), falling back to a slow poll loop for servers without IDLE.
+/// Reconnects with backoff on connection loss; exits if the account is
+/// removed.
+fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig) {
+    let mut backoff = 5u64;
+    loop {
+        // Stop if the account was deleted while we were away.
+        let st = app.state::<AppState>();
+        let still_there = {
+            let cfg = st.config.lock().unwrap();
+            cfg.accounts.iter().any(|a| a.name == acc.name)
+        };
+        if !still_there {
+            log::info!("background watcher for {} exiting (account removed)", acc.email);
+            let st = app.state::<AppState>();
+            let mut watched = st.idle_watched.lock().unwrap();
+            watched.remove(&acc.name);
+            return;
+        }
+        match idle_cycle(app, acc) {
+            Ok(IdleOutcome::NoIdle) => {
+                log::info!(
+                    "{} has no IDLE support; falling back to slow polling",
+                    acc.email
+                );
+                slow_poll_account(app, acc);
+                return;
+            }
+            Err(e) => {
+                log::warn!("background watcher for {} lost: {e}; retrying in {backoff}s", acc.email);
+                std::thread::sleep(Duration::from_secs(backoff));
+                backoff = (backoff * 2).min(60);
+            }
+        }
+    }
+}
+
+/// Fallback for servers without IDLE: a modest interval check (new mail +
+/// offline-flag sync) that keeps notifications working without hammering
+/// the server. The frontend's manual Refresh stays the primary trigger.
+fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig) {
+    loop {
+        std::thread::sleep(Duration::from_secs(15 * 60));
+        let Some(inbox) = inbox_folder_name(acc) else { continue };
+        match mail::list_folder_uids(acc, &inbox) {
+            Ok(uids) => {
+                let new = diff_new_uids(acc, &inbox, &uids);
+                if !new.is_empty() {
+                    log::info!(
+                        "new mail: {} message(s) for {} ({inbox})",
+                        new.len(),
+                        acc.email
+                    );
+                    // No live session here: sync the cache first so the
+                    // sender/subject can come from the stored summaries.
+                    warm_inbox_cache(acc, &inbox);
+                    let (from, subject, extra) = cached_preview(acc, &inbox, &new);
+                    fire_new_mail_notification(app, &from, &subject, extra);
+                }
+                flush_pending_flags(app);
+                let _ = app.emit("mail-refresh", ());
+            }
+            Err(e) => log::warn!("slow poll for {} failed: {e}", acc.email),
+        }
+    }
+}
+
+/// Full INBOX sync triggered by new-mail detection: fetch + cache the
+/// folder's summaries and bodies so the message list is warm. Switching to
+/// INBOX (or refreshing it) then shows the new mail instantly from cache
+/// instead of streaming from the server first — closing the gap between
+/// the toast and the message appearing.
+fn warm_inbox_cache(acc: &AccountConfig, inbox: &str) {
+    let acc2 = acc.clone();
+    let inbox2 = inbox.to_string();
+    if let Err(e) = mail::list_messages_streamed_blocking(
+        acc,
+        inbox,
+        move |batch, bodies| {
+            if let Ok(mut s) = store::Store::open(&acc2) {
+                let _ = s.upsert_summaries(&inbox2, &batch);
+                let _ = s.store_bodies(&inbox2, &bodies);
+            }
+        },
+        |_server_uids| {},
+    ) {
+        log::warn!("inbox warm refresh failed for {}: {e}", acc.email);
+    }
+}
+
+/// One IDLE connection lifetime: connect, select the inbox, verify the
+/// server supports IDLE, then idle until the connection drops. Returns
+/// `NoIdle` (fall back to slow polling) or an error to trigger a reconnect.
+fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome, String> {
+    let Some(inbox) = inbox_folder_name(acc) else {
+        return Err("no inbox folder found".into());
+    };
+    let mut session = mail::imap_session_pub(acc)?;
+    session
+        .select(&inbox)
+        .map_err(|e| format!("SELECT {inbox} failed: {e}"))?;
+    let caps = session
+        .capabilities()
+        .map_err(|e| format!("CAPABILITY failed: {e}"))?;
+    if !caps.has_str("IDLE") {
+        return Ok(IdleOutcome::NoIdle);
+    }
+    // We are connected: flush any offline flag changes queued while we
+    // were away (the reconnect itself is the "back online" signal).
+    flush_pending_flags(app);
+    log::info!("background watcher for {} watching {inbox} (IDLE)", acc.email);
+
+    loop {
+        use imap::extensions::idle::WaitOutcome;
+        // Bind the outcome first so the temporary IDLE handle (which borrows
+        // the session mutably) is dropped before we touch the session again.
+        let outcome = session.idle().wait_while(imap::extensions::idle::stop_on_any);
+        match outcome {
+            Ok(WaitOutcome::MailboxChanged) => {
+                // The server pushed a mailbox change — most likely new mail.
+                // Reuse this session (the IDLE borrow has ended) to diff the
+                // UIDs and react instantly.
+                let uids = match session.uid_search("ALL") {
+                    Ok(ids) => {
+                        let mut v: Vec<u32> = ids.into_iter().collect();
+                        v.sort_unstable();
+                        v
+                    }
+                    Err(e) => {
+                        log::warn!("UID SEARCH after IDLE failed: {e}");
+                        continue;
+                    }
+                };
+                let new = diff_new_uids(acc, &inbox, &uids);
+                if !new.is_empty() {
+                    log::info!(
+                        "new mail: {} message(s) for {} ({inbox})",
+                        new.len(),
+                        acc.email
+                    );
+                    // Sender + subject from the ENVELOPE on this very
+                    // session — instant, no full sync needed.
+                    let newest = *new.iter().max().unwrap_or(&0);
+                    let (from, subject) =
+                        mail::fetch_envelope_preview(&mut session, newest).unwrap_or_default();
+                    fire_new_mail_notification(app, &from, &subject, new.len() - 1);
+                    // Warm the INBOX cache so the message is already in the
+                    // list when the user opens/refreshes it — the toast
+                    // should not beat the message.
+                    warm_inbox_cache(acc, &inbox);
+                }
+                flush_pending_flags(app);
+                let _ = app.emit("mail-refresh", ());
+                // Re-enter IDLE.
+            }
+            Ok(WaitOutcome::TimedOut) => {
+                // keepalive re-issued the IDLE; keep waiting.
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// The configured auto-refresh interval in minutes (0 = off).
 #[tauri::command]
-fn get_refresh_interval(state: State<AppState>) -> u64 {
-    state.config.lock().unwrap().refresh_interval_minutes
-}
-
-/// Persist the auto-refresh interval (minutes, 0 = off). Clamped so a
-/// nonsense value can't disable polling forever by accident.
-#[tauri::command]
-fn set_refresh_interval(minutes: u64, state: State<AppState>) -> Result<(), String> {
-    let minutes = minutes.min(24 * 60);
-    let mut cfg = state.config.lock().unwrap();
-    cfg.refresh_interval_minutes = minutes;
-    let result = cfg.save();
-    drop(cfg);
-    log::info!("refresh interval set to {minutes} minute(s)");
-    result
-}
-
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();    let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
@@ -743,9 +893,10 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             config: Mutex::new(config),
+            idle_watched: Mutex::new(std::collections::HashSet::new()),
         })
         .setup(|app| {
-            spawn_inbox_poller(app.handle().clone());
+            spawn_missing_idle_watchers(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -760,9 +911,7 @@ fn main() {
             save_attachment,
             move_message,
             delete_message,
-            send_email,
-            get_refresh_interval,
-            set_refresh_interval
+            send_email
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
