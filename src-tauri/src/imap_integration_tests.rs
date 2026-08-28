@@ -571,3 +571,32 @@ fn fetch_envelope_preview_missing_uid_errors() {
         assert!(err.contains("not found"), "unexpected error: {err}");
     });
 }
+
+#[test]
+fn fetch_envelope_preview_decodes_real_world_github_subject() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        // Mirrors a real GitHub-style notification: the raw header carries
+        // the special char as an RFC 2047 Q-encoded word (versiòne =
+        // versi=C3=B2ne). Uses a generic repo/recipient so no real user or
+        // repository is referenced in the tests.
+        let mut msg = FakeMessage::new(
+            1,
+            "[testuser/testmessage] Release v1.9.0 - =?utf-8?Q?versi=C3=B2ne?= v1.9.0",
+            "notifications@example.com",
+            1,
+            false,
+        );
+        msg.from_name = "Test Sender".into();
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "PreviewGithub");
+        let mut session = crate::mail::imap_session_pub(&acc).expect("session");
+        session.select("INBOX").expect("select");
+
+        let (from, subject) =
+            crate::mail::fetch_envelope_preview(&mut session, 1).expect("preview");
+        assert_eq!(subject, "[testuser/testmessage] Release v1.9.0 - versiòne v1.9.0");
+        assert!(from.contains("Test Sender"));
+        assert!(from.contains("notifications@example.com"));
+    });
+}
