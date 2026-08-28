@@ -389,3 +389,111 @@ fn empty_folder_load_is_empty_not_error() {
     assert!(store.load_summaries("INBOX").unwrap().is_empty());
     assert!(store.load_folders().unwrap().is_empty());
 }
+
+// ---------------------------------------------------- new-mail tracking
+
+#[test]
+fn first_check_records_baseline_without_notifying() {
+    let (_dir, mut store) = test_store("baseline");
+    let new = store
+        .new_uids_since_last_sync("INBOX", &[1, 2, 3, 4, 5])
+        .unwrap();
+    assert!(new.is_empty(), "first check must not report new mail");
+    assert_eq!(
+        store.notified_uids("INBOX").unwrap().len(),
+        5,
+        "baseline UIDs recorded"
+    );
+}
+
+#[test]
+fn later_check_reports_only_genuinely_new_uids() {
+    let (_dir, mut store) = test_store("diff");
+    store
+        .new_uids_since_last_sync("INBOX", &[1, 2, 3])
+        .unwrap();
+    let new = store
+        .new_uids_since_last_sync("INBOX", &[1, 2, 3, 7, 8])
+        .unwrap();
+    assert_eq!(new, vec![7, 8], "only new UIDs reported");
+    // Recorded now, so a third identical check reports nothing.
+    let new = store
+        .new_uids_since_last_sync("INBOX", &[1, 2, 3, 7, 8])
+        .unwrap();
+    assert!(new.is_empty());
+}
+
+#[test]
+fn empty_baseline_then_first_message_notifies() {
+    let (_dir, mut store) = test_store("empty-first");
+    // First check with an empty inbox establishes an empty baseline.
+    assert!(store.new_uids_since_last_sync("INBOX", &[]).unwrap().is_empty());
+    // A message arriving later must be reported as new — it must not be
+    // absorbed into a second baseline.
+    let new = store.new_uids_since_last_sync("INBOX", &[42]).unwrap();
+    assert_eq!(new, vec![42]);
+}
+
+#[test]
+fn folders_tracked_independently() {
+    let (_dir, mut store) = test_store("per-folder");
+    store.new_uids_since_last_sync("INBOX", &[1, 2]).unwrap();
+    store.new_uids_since_last_sync("Archive", &[1]).unwrap();
+    assert!(store.new_uids_since_last_sync("INBOX", &[1, 2, 3]).unwrap() == vec![3]);
+    assert!(store.new_uids_since_last_sync("Archive", &[1, 2]).unwrap() == vec![2]);
+}
+
+#[test]
+fn notified_state_survives_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let email = "reopen@example.com";
+    {
+        let mut store = Store::open_in(dir.path(), email).unwrap();
+        store.new_uids_since_last_sync("INBOX", &[5, 6]).unwrap();
+    }
+    {
+        let mut store = Store::open_in(dir.path(), email).unwrap();
+        let new = store.new_uids_since_last_sync("INBOX", &[5, 6, 9]).unwrap();
+        assert_eq!(new, vec![9], "persisted across reopens");
+    }
+}
+
+// ---------------------------------------------------- offline flag queue
+
+#[test]
+fn pending_flags_queue_roundtrip() {
+    let (_dir, mut store) = test_store("pending");
+    assert!(store.pending_flags().unwrap().is_empty());
+
+    store.upsert_pending_flag("INBOX", 7, true).unwrap();
+    store.upsert_pending_flag("INBOX", 8, false).unwrap();
+    let pending = store.pending_flags().unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.contains(&("INBOX".into(), 7, true)));
+    assert!(pending.contains(&("INBOX".into(), 8, false)));
+
+    store.remove_pending_flag("INBOX", 7).unwrap();
+    let pending = store.pending_flags().unwrap();
+    assert_eq!(pending, vec![("INBOX".into(), 8, false)]);
+}
+
+#[test]
+fn pending_flag_upsert_replaces_state() {
+    let (_dir, mut store) = test_store("pending-replace");
+    store.upsert_pending_flag("INBOX", 3, true).unwrap();
+    store.upsert_pending_flag("INBOX", 3, false).unwrap();
+    let pending = store.pending_flags().unwrap();
+    assert_eq!(pending, vec![("INBOX".into(), 3, false)]);
+}
+
+#[test]
+fn pending_flags_purged_for_vanished_uids() {
+    let (_dir, mut store) = test_store("pending-purge");
+    store.upsert_pending_flag("INBOX", 1, true).unwrap();
+    store.upsert_pending_flag("INBOX", 2, true).unwrap();
+    store.upsert_pending_flag("Archive", 2, true).unwrap();
+    let server: std::collections::HashSet<u32> = [2].into_iter().collect();
+    store.remove_pending_uids_not_in("INBOX", &server).unwrap();
+    let pending = store.pending_flags().unwrap();
+    assert_eq!(pending, vec![("INBOX".into(), 2, true), ("Archive".into(), 2, true)]);
+}

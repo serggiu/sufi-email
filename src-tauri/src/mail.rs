@@ -93,6 +93,22 @@ pub fn imap_session_pub(
     imap_session(acc)
 }
 
+/// All UIDs present in a folder, sorted ascending. Used by the background
+/// inbox poller to diff against the notified set. Blocking IMAP — callers
+/// should run it on a worker thread.
+pub fn list_folder_uids(acc: &AccountConfig, folder: &str) -> Result<Vec<u32>, String> {
+    let mut session = imap_session(acc)?;
+    session
+        .select(folder)
+        .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+    let uids = session
+        .uid_search("ALL")
+        .map_err(|e| format!("UID SEARCH failed: {e}"))?;
+    let mut uids: Vec<u32> = uids.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
+}
+
 /// Verify IMAP credentials by logging in and immediately logging out.
 pub async fn test_imap(acc: &AccountConfig) -> Result<(), String> {
     let acc = acc.clone();
@@ -161,43 +177,47 @@ fn count_unseen(
 
 pub async fn list_folders(acc: &AccountConfig) -> Result<Vec<Folder>, String> {
     let acc = acc.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut session = imap_session(&acc)?;
-        let names = session
-            .list(Some(""), Some("*"))
-            .map_err(|e| format!("LIST failed: {e}"))?;
-        let mut folders = Vec::new();
-        for n in names.iter() {
-            // \NoSelect folders can't be STATUSed; skip the query for them.
-            let selectable = !n
-                .attributes()
-                .iter()
-                .any(|a| format!("{a:?}").contains("NoSelect"));
-            let unread = if selectable {
-                // RFC 3501: STATUS UNSEEN reports the sequence number of the
-                // FIRST unseen message, not a count. Use SEARCH UNSEEN and
-                // count the results instead.
-                count_unseen(&mut session, n.name())
-            } else {
-                0
-            };
-            folders.push(Folder {
-                name: n.name().to_string(),
-                delimiter: n.delimiter().unwrap_or("/").to_string(),
-                special_use: special_use_of(
-                    &n.attributes()
-                        .iter()
-                        .map(|f| format!("{f:?}"))
-                        .collect::<Vec<_>>(),
-                ),
-                unread,
-            });
-        }
-        folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        Ok(folders)
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || list_folders_blocking(&acc))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Blocking core of [`list_folders`], usable from worker threads (e.g. the
+/// background inbox poller) that have no async runtime to hand.
+pub fn list_folders_blocking(acc: &AccountConfig) -> Result<Vec<Folder>, String> {
+    let mut session = imap_session(acc)?;
+    let names = session
+        .list(Some(""), Some("*"))
+        .map_err(|e| format!("LIST failed: {e}"))?;
+    let mut folders = Vec::new();
+    for n in names.iter() {
+        // \NoSelect folders can't be STATUSed; skip the query for them.
+        let selectable = !n
+            .attributes()
+            .iter()
+            .any(|a| format!("{a:?}").contains("NoSelect"));
+        let unread = if selectable {
+            // RFC 3501: STATUS UNSEEN reports the sequence number of the
+            // FIRST unseen message, not a count. Use SEARCH UNSEEN and
+            // count the results instead.
+            count_unseen(&mut session, n.name())
+        } else {
+            0
+        };
+        folders.push(Folder {
+            name: n.name().to_string(),
+            delimiter: n.delimiter().unwrap_or("/").to_string(),
+            special_use: special_use_of(
+                &n.attributes()
+                    .iter()
+                    .map(|f| format!("{f:?}"))
+                    .collect::<Vec<_>>(),
+            ),
+            unread,
+        });
+    }
+    folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(folders)
 }
 
 fn decode_imap_utf8(bytes: &[u8]) -> String {
@@ -416,10 +436,22 @@ mod text_tests {
     }
 }
 
-/// Build a summary from a single fetched message. `raw` is the full RFC 822
-/// message; mail-parser decodes RFC 2047 headers, charsets and transfer
-/// encodings, then light cleanup strips any residual HTML.
-fn summarize(f: &imap::types::Fetch) -> Option<MessageSummary> {
+/// Plain-text / HTML body extracted while streaming a folder's message
+/// list, so the cache can be warmed for free — the full body is already
+/// downloaded to build the snippet, so storing it makes later selection a
+/// cache hit instead of another IMAP fetch.
+#[derive(Debug, Clone)]
+pub struct BatchBody {
+    pub uid: u32,
+    pub text: Option<String>,
+    pub html: Option<String>,
+}
+
+/// Build a summary from a single fetched message, plus the message's plain
+/// text and HTML bodies so the caller can cache them. `raw` is the full
+/// RFC 822 message; mail-parser decodes RFC 2047 headers, charsets and
+/// transfer encodings, then light cleanup strips any residual HTML.
+fn summarize(f: &imap::types::Fetch) -> Option<(MessageSummary, BatchBody)> {
     let env = f.envelope()?;
     let fallback_subject = env
         .subject
@@ -501,15 +533,28 @@ fn summarize(f: &imap::types::Fetch) -> Option<MessageSummary> {
         })
         .unwrap_or_default();
 
-    Some(MessageSummary {
-        uid: f.uid.unwrap_or(f.message),
-        subject,
-        from,
-        date,
-        seen,
-        has_attachment,
-        snippet,
-    })
+    let (text, html) = parsed
+        .as_ref()
+        .map(|m| {
+            (
+                m.body_text(0).map(|t| t.to_string()),
+                m.body_html(0).map(|h| h.to_string()),
+            )
+        })
+        .unwrap_or((None, None));
+
+    Some((
+        MessageSummary {
+            uid: f.uid.unwrap_or(f.message),
+            subject,
+            from,
+            date,
+            seen,
+            has_attachment,
+            snippet,
+        },
+        BatchBody { uid: f.uid.unwrap_or(f.message), text, html },
+    ))
 }
 
 /// Stream message summaries to the UI in batches of ~25 (newest first) as
@@ -517,7 +562,7 @@ fn summarize(f: &imap::types::Fetch) -> Option<MessageSummary> {
 pub async fn list_messages_streamed(
     acc: &AccountConfig,
     folder: &str,
-    on_batch: impl Fn(Vec<MessageSummary>) + Send + 'static,
+    on_batch: impl Fn(Vec<MessageSummary>, Vec<BatchBody>) + Send + 'static,
     on_reconcile: impl Fn(std::collections::HashSet<u32>) + Send + 'static,
 ) -> Result<(), String> {
     const CHUNK: u32 = 25;
@@ -557,13 +602,16 @@ pub async fn list_messages_streamed(
                 .fetch(&seqs, "(UID FLAGS ENVELOPE BODYSTRUCTURE BODY.PEEK[])")
                 .map_err(|e| format!("FETCH failed: {e}"))?;
             log::debug!("chunk {seqs}: {} raw messages", fetches.len());
-            let mut batch: Vec<MessageSummary> = fetches.iter().filter_map(summarize).collect();
-            // Within a chunk the server returns ascending sequence numbers;
-            // sort so the UI receives newest-first.
+            let mut batch: Vec<MessageSummary> = Vec::new();
+            let mut bodies: Vec<BatchBody> = Vec::new();
+            for (summary, body) in fetches.iter().filter_map(summarize) {
+                batch.push(summary);
+                bodies.push(body);
+            }
             batch.sort_by(|a, b| b.date.cmp(&a.date));
             log::debug!("chunk {seqs}: {} summaries parsed", batch.len());
             if !batch.is_empty() {
-                on_batch(batch);
+                on_batch(batch, bodies);
             }
             if bottom == oldest || top == 0 {
                 break;
@@ -584,12 +632,23 @@ pub async fn list_messages_streamed(
     .map_err(|e| format!("join error: {e}"))?
 }
 
-/// Fetch a message and return attachment metadata (no bodies saved to disk).
-pub async fn fetch_attachments_meta(
+/// A message's parsed body plus its attachment metadata, fetched in a
+/// single IMAP connection and a single FETCH (BODY.PEEK[]) round trip.
+/// The attachment list is extracted from the very same raw message that
+/// produced the body — no second download.
+#[derive(Debug, Clone)]
+pub struct FetchedMessage {
+    pub body: MessageBody,
+    pub attachments: Vec<store::AttachmentMeta>,
+}
+
+/// Fetch a message's body and attachment metadata in one connection.
+/// Callers (the cache-miss path in the UI command) persist both together.
+pub async fn fetch_message_full(
     acc: &AccountConfig,
     folder: &str,
     uid: u32,
-) -> Result<Vec<store::AttachmentMeta>, String> {
+) -> Result<FetchedMessage, String> {
     let acc = acc.clone();
     let folder = folder.to_string();
     tauri::async_runtime::spawn_blocking(move || {
@@ -606,35 +665,58 @@ pub async fn fetch_attachments_meta(
             .next()
             .and_then(|f| f.body())
             .ok_or_else(|| format!("message uid {uid} not found"))?;
-        Ok(store::extract_attachments(raw))
+        let msg = MessageParser::default().parse(raw).ok_or("unparseable message")?;
+        let html = msg.body_html(0).map(|b| b.to_string());
+        let text = msg.body_text(0).map(|b| b.to_string());
+        let attachments = store::extract_attachments(raw);
+        Ok(FetchedMessage {
+            body: MessageBody { uid, html, text },
+            attachments,
+        })
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
 /// Set or clear the \Seen flag for a message (by UID).
+/// Blocking core of [`set_seen`], usable from worker threads (the inbox
+/// poller's offline-sync flush) that have no async runtime to hand.
+pub fn set_seen_blocking(
+    acc: &AccountConfig,
+    folder: &str,
+    uid: u32,
+    seen: bool,
+) -> Result<u32, String> {
+    let mut session = imap_session(acc)?;
+    session
+        .select(folder)
+        .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+    let seqs = format!("{uid}");
+    let query = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
+    session
+        .uid_store(seqs, query)
+        .map_err(|e| format!("STORE failed: {e}"))?;
+    // SEARCH operates on the selected mailbox; count is the server truth.
+    let unseen = session
+        .search("UNSEEN")
+        .map_err(|e| format!("SEARCH UNSEEN failed: {e}"))?;
+    Ok(unseen.len() as u32)
+}
+
+/// Set or clear the \Seen flag for a message (by UID). Returns the folder's
+/// fresh unread count straight from the server (SEARCH UNSEEN in the same
+/// session), so the badge never depends on how complete the local cache is.
 pub async fn set_seen(
     acc: &AccountConfig,
     folder: &str,
     uid: u32,
     seen: bool,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let acc = acc.clone();
     let folder = folder.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut session = imap_session(&acc)?;
-        session
-            .select(&folder)
-            .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
-        let seqs = format!("{uid}");
-        let query = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
-        session
-            .uid_store(seqs, query)
-            .map_err(|e| format!("STORE failed: {e}"))?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || set_seen_blocking(&acc, &folder, uid, seen))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
 }
 
 /// Copy a message to another folder, then mark it \Deleted in the source.
@@ -700,31 +782,6 @@ pub async fn delete_message(
     .map_err(|e| format!("join error: {e}"))?
 }
 
-pub async fn fetch_message(acc: &AccountConfig, folder: &str, uid: u32) -> Result<MessageBody, String> {
-    let acc = acc.clone();
-    let folder = folder.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut session = imap_session(&acc)?;
-        session
-            .select(&folder)
-            .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
-        let seqs = format!("{uid}");
-        let fetches = session
-            .uid_fetch(seqs, "(BODY.PEEK[])")
-            .map_err(|e| format!("FETCH failed: {e}"))?;
-        let raw = fetches
-            .iter()
-            .next()
-            .and_then(|f| f.body())
-            .ok_or_else(|| format!("message uid {uid} not found"))?;
-        let msg = MessageParser::default().parse(raw).ok_or("unparseable message")?;
-        let html = msg.body_html(0).map(|b| b.to_string());
-        let text = msg.body_text(0).map(|b| b.to_string());
-        Ok(MessageBody { uid, html, text })
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
-}
 
 /// Verify SMTP credentials by connecting, issuing AUTH, and closing.
 pub async fn test_smtp(acc: &AccountConfig) -> Result<(), String> {

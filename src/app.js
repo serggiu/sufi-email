@@ -52,12 +52,17 @@ async function loadFolders() {
     if (cached.length > 0) {
       state.folders = cached;
       renderFolders();
-      // Auto-select INBOX on first load.
+      // On first load open the folder the last message was read in; the
+      // message itself is restored once its list has rendered.
       if (!state.folder) {
-        const inbox =
-          state.folders.find((f) => f.specialUse === null && /inbox/i.test(f.name)) ||
+        const saved = loadLastSelection();
+        const target =
+          (saved && state.folders.find((f) => f.name === saved.folder)) ||
+          state.folders.find(
+            (f) => f.specialUse === null && /inbox/i.test(f.name)
+          ) ||
           state.folders[0];
-        if (inbox) selectFolder(inbox.name);
+        if (target) selectFolder(target.name);
       }
     }
   } catch (e) {
@@ -203,6 +208,74 @@ async function selectFolder(name) {
   await loadMessages();
 }
 
+/* ---------- last-selected message ---------- */
+
+// Remember the last message opened in each account+folder, plus which one
+// was most recently used (for launch restore). Switching folders re-opens
+// the message you last had open there; launching reopens the last one
+// overall.
+const SELECTION_KEY = "sufi-selections";
+
+function loadSelectionRaw() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SELECTION_KEY));
+    if (raw && typeof raw === "object") {
+      // Migrate the old single-selection format { account, folder, uid }.
+      if (raw.account && raw.folder && Number.isFinite(raw.uid)) {
+        const key = selectionKey(raw.account, raw.folder);
+        return { lastKey: key, folders: { [key]: raw.uid } };
+      }
+      if (raw.folders && typeof raw.folders === "object") return raw;
+    }
+  } catch (_) {}
+  return { lastKey: null, folders: {} };
+}
+
+function selectionKey(account, folder) {
+  return account + "::" + folder;
+}
+
+function saveSelection(account, folder, uid) {
+  const sel = loadSelectionRaw();
+  sel.folders[selectionKey(account, folder)] = uid;
+  sel.lastKey = selectionKey(account, folder);
+  try {
+    localStorage.setItem(SELECTION_KEY, JSON.stringify(sel));
+  } catch (_) {}
+}
+
+// Most recent selection overall — used to reopen the app where you left off.
+function loadLastSelection() {
+  const sel = loadSelectionRaw();
+  const key = sel.lastKey;
+  if (!key || !(key in sel.folders)) return null;
+  const sep = key.indexOf("::");
+  return {
+    account: key.slice(0, sep),
+    folder: key.slice(sep + 2),
+    uid: sel.folders[key],
+  };
+}
+
+// The last message opened in a specific account+folder, or null.
+function loadFolderSelection(account, folder) {
+  const sel = loadSelectionRaw();
+  return sel.folders[selectionKey(account, folder)] ?? null;
+}
+
+// Forget a folder's remembered message (when it was deleted/moved away).
+function clearFolderSelection(account, folder) {
+  const sel = loadSelectionRaw();
+  const key = selectionKey(account, folder);
+  if (key in sel.folders) {
+    delete sel.folders[key];
+    if (sel.lastKey === key) sel.lastKey = null;
+    try {
+      localStorage.setItem(SELECTION_KEY, JSON.stringify(sel));
+    } catch (_) {}
+  }
+}
+
 /* ---------- message list ---------- */
 
 function showListLoading(text) {
@@ -232,8 +305,12 @@ async function loadMessages() {
   let first = true;
 
   const finish = () => {
+    // A folder switch mid-load invalidates this load; the newer load's
+    // finish() takes over (same guard as onBatch).
+    if (state.folder !== folderAtStart) return;
     hideListLoading();
     renderMessages();
+    restoreSelection();
   };
 
   try {
@@ -256,6 +333,11 @@ async function loadMessages() {
         (a, b) => (b.date || 0) - (a.date || 0)
       );
       renderMessages();
+      // Restore as soon as the first (cached) batch renders — the backend
+      // serves the cache before it streams from the server, so the last
+      // selection appears immediately instead of after the full sync.
+      // Idempotent: the guard in restoreSelection skips once selected.
+      restoreSelection();
     };
 
     await invoke("list_messages", {
@@ -263,11 +345,15 @@ async function loadMessages() {
       folder: state.folder,
       onBatch,
     });
-    finish();
   } catch (e) {
     hideListLoading();
     setOnlineStatus(false);
     showError(String(e));
+  } finally {
+    // Always finish (render + restore the folder's last selection), even
+    // when the server sync failed: the cached batch already made it to the
+    // list via the channel, so the restore works offline too.
+    finish();
   }
 }
 
@@ -279,6 +365,7 @@ function renderMessages() {
     if (m.seen) li.classList.add("read");
     else li.classList.add("unread");
     if (m.uid === state.selectedUid) li.classList.add("selected");
+    li.dataset.uid = String(m.uid);
 
     const top = document.createElement("div");
     top.className = "msg-top";
@@ -311,48 +398,76 @@ function renderMessages() {
   }
 }
 
+// Reopen the last-read message of the current folder after a (re)load: the
+// remembered UID for this account+folder, if it is still in the list. Runs
+// on every completed load but no-ops once the message is already selected,
+// so auto-refresh cycles don't re-fetch its body.
+function restoreSelection() {
+  const savedUid = loadFolderSelection(state.account.name, state.folder);
+  if (savedUid == null || state.selectedUid === savedUid) return;
+  const msg = state.messages.find((m) => m.uid === savedUid);
+  if (!msg) return;
+  const li = document.querySelector(`#message-list li[data-uid="${savedUid}"]`);
+  if (!li) return;
+  selectMessage(savedUid, li);
+}
+
 /* ---------- mark as read / unread ---------- */
 
 let markReadTimer = null;
 
 async function setSeen(uid, seen) {
+  const msg = state.messages.find((m) => m.uid === uid);
+  const wasUnread = !!msg && !msg.seen;
+
+  // Optimistic UI: flip the row and adjust the badge right away (the
+  // debounce has already elapsed), without waiting for the IMAP round
+  // trip. The server call below reconciles with the authoritative count.
+  if (msg) msg.seen = seen;
+  const f = state.folders.find((x) => x.name === state.folder);
+  if (f && msg && wasUnread === seen) {
+    // The flip actually changed the unread status.
+    f.unread = seen ? Math.max(0, (f.unread || 0) - 1) : (f.unread || 0) + 1;
+  }
+  renderMessages();
+  renderFolders();
+
   try {
-    await invoke("mark_message", {
+    // Returns the folder's authoritative unread count from the server
+    // (offline: applies locally + queues, returns a local estimate).
+    const unread = await invoke("mark_message", {
       account: state.account.name,
       folder: state.folder,
       uid,
       seen,
     });
-    // Update local state + re-render without refetching from the server.
-    const msg = state.messages.find((m) => m.uid === uid);
-    if (msg) msg.seen = seen;
-    renderMessages();
-    refreshFolderUnread();
+    const f2 = state.folders.find((x) => x.name === state.folder);
+    if (f2) f2.unread = Number(unread) || 0;
+    renderFolders();
   } catch (e) {
+    // Genuine failure (account gone, store error…): roll the row back so
+    // the UI matches reality until the next refresh.
     showError(String(e));
+    const m2 = state.messages.find((m) => m.uid === uid);
+    if (m2) m2.seen = !seen;
+    renderMessages();
   }
-}
-
-// Adjust the current folder's unread badge locally after a read/unread change.
-function refreshFolderUnread() {
-  const f = state.folders.find((x) => x.name === state.folder);
-  if (!f) return;
-  f.unread = state.messages.filter((m) => !m.seen).length;
-  renderFolders();
 }
 
 async function selectMessage(uid, li) {
   state.selectedUid = uid;
+  saveSelection(state.account.name, state.folder, uid);
   document
     .querySelectorAll("#message-list li")
     .forEach((el) => el.classList.remove("selected"));
   li.classList.add("selected");
 
-  // Keep selected for >=2s to mark as read.
+  // Keep selected for >=1.3s to mark as read. While offline the backend
+  // applies the change locally and queues it for the server.
   clearTimeout(markReadTimer);
   const msg = state.messages.find((m) => m.uid === uid);
   if (msg && !msg.seen) {
-    markReadTimer = setTimeout(() => setSeen(uid, true), 2000);
+    markReadTimer = setTimeout(() => setSeen(uid, true), 1300);
   }
 
   try {
@@ -361,6 +476,9 @@ async function selectMessage(uid, li) {
       folder: state.folder,
       uid,
     });
+    // The user may have clicked another message while this body was
+    // in flight (e.g. a background restore racing a manual click).
+    if (state.selectedUid !== uid) return;
     renderPreview(body);
   } catch (e) {
     showError(String(e));
@@ -441,7 +559,12 @@ async function deleteMessage(uid) {
     // Remove locally and clear the preview if it was showing this message.
     state.messages = state.messages.filter((m) => m.uid !== uid);
     renderMessages();
-    refreshFolderUnread();
+    if (loadFolderSelection(state.account.name, state.folder) === uid) {
+      clearFolderSelection(state.account.name, state.folder);
+    }
+    // Badges come from the server, not a local recompute over a possibly-
+    // incomplete message list.
+    loadFolders();
     if (state.selectedUid === uid) {
       state.selectedUid = null;
       renderPreviewEmpty();
@@ -478,7 +601,12 @@ async function moveMessage(uid, destFolder) {
     });
     state.messages = state.messages.filter((m) => m.uid !== uid);
     renderMessages();
-    refreshFolderUnread();
+    if (loadFolderSelection(state.account.name, state.folder) === uid) {
+      clearFolderSelection(state.account.name, state.folder);
+    }
+    // Badges come from the server, not a local recompute over a possibly-
+    // incomplete message list.
+    loadFolders();
     if (state.selectedUid === uid) {
       state.selectedUid = null;
       renderPreviewEmpty();
@@ -699,7 +827,11 @@ function renderAccountsMenu() {
 
 async function refreshAccounts(preferredName) {
   state.accounts = await invoke("get_accounts");
+  // Reopen the account the last message was read in, falling back to the
+  // existing preference chain.
+  const saved = loadLastSelection();
   const target =
+    (saved && state.accounts.find((a) => a.name === saved.account)) ||
     (preferredName && state.accounts.find((a) => a.name === preferredName)) ||
     (state.account && state.accounts.find((a) => a.name === state.account.name)) ||
     state.accounts[0] ||
@@ -927,41 +1059,47 @@ function initFontSize() {
 
 /* ---------- auto-refresh ---------- */
 
-const REFRESH_KEY = "sufi-refresh-minutes";
-let autoRefreshTimer = null;
+// The auto-refresh interval lives in the backend config so the background
+// inbox poller and the UI share it: the poller checks for new mail on this
+// cadence, fires the notification, and emits `mail-refresh` — which is what
+// drives the list/folder refresh here (see initMailRefreshListener). There
+// is no separate frontend timer; notification and list refresh always
+// happen in the same cycle.
+let refreshMinutes = 1; // matches the backend default; hydrated at startup
 
-function getRefreshMinutes() {
-  const v = Number(localStorage.getItem(REFRESH_KEY));
-  return Number.isFinite(v) && v > 0 ? v : 0; // 0 = off
-}
-
-function renderRefreshMenu() {
-  const current = getRefreshMinutes();
+async function renderRefreshMenu() {
+  if (invoke) {
+    try {
+      refreshMinutes = Number(await invoke("get_refresh_interval"));
+    } catch (_) {}
+  }
   document.querySelectorAll("#refresh-menu .menu-item").forEach((el) => {
-    el.classList.toggle("active", Number(el.dataset.minutes) === current);
+    el.classList.toggle("active", Number(el.dataset.minutes) === refreshMinutes);
   });
 }
 
-function setRefreshMinutes(minutes) {
-  localStorage.setItem(REFRESH_KEY, String(minutes));
-  scheduleAutoRefresh();
+async function setRefreshMinutes(minutes) {
+  if (!invoke) return;
+  try {
+    await invoke("set_refresh_interval", { minutes: Number(minutes) });
+    refreshMinutes = Number(minutes);
+  } catch (e) {
+    showError(String(e));
+  }
   renderRefreshMenu();
 }
 
-function scheduleAutoRefresh() {
-  if (autoRefreshTimer) {
-    clearInterval(autoRefreshTimer);
-    autoRefreshTimer = null;
-  }
-  const minutes = getRefreshMinutes();
-  if (minutes > 0) {
-    autoRefreshTimer = setInterval(() => {
-      // Only auto-fetch when online; the offline poller handles recovery.
-      if (state.online && state.account && state.folder) {
-        loadMessages();
-      }
-    }, minutes * 60 * 1000);
-  }
+// Refresh folders + the visible message list on every poller tick. The
+// poller runs on the same interval as this UI, so the list stays in step
+// with the notifications; the offline flag guards against spamming errors
+// while disconnected (the offline poller handles recovery).
+function initMailRefreshListener() {
+  if (!window.__TAURI__ || !window.__TAURI__.event) return;
+  window.__TAURI__.event.listen("mail-refresh", () => {
+    if (!state.online || !state.account) return;
+    loadFolders();
+    if (state.folder) loadMessages();
+  });
 }
 
 function init() {
@@ -993,7 +1131,7 @@ function init() {
       $("refresh-menu").classList.add("hidden");
     });
   });
-  scheduleAutoRefresh();
+  initMailRefreshListener();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   document.getElementById("compose-form").addEventListener("submit", sendCompose);
   $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());

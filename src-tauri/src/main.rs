@@ -17,10 +17,30 @@ mod store_tests;
 
 use account::{AccountConfig, AccountInfo, Config};
 use std::sync::Mutex;
+use std::time::Duration;
+use tauri::Emitter;
+use tauri::Manager;
 use tauri::State;
 
 pub struct AppState {
     pub config: Mutex<Config>,
+}
+
+/// Fire the silent "new mail" toast through the OS notification daemon.
+/// Visual only: no sound hint is set (the freedesktop spec is silent by
+/// default; `.silent()` makes that explicit on platforms that support it).
+fn notify_new_mail(app: &tauri::AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("New email")
+        .body("You have a new email.")
+        .silent()
+        .show()
+    {
+        log::warn!("new-mail notification failed: {e}");
+    }
 }
 
 /// Accounts for the UI — a sanitized view without the sealed passwords.
@@ -131,6 +151,7 @@ async fn delete_account(
 async fn list_folders(
     account: String,
     on_refresh: tauri::ipc::Channel<(Vec<mail::Folder>, bool)>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<mail::Folder>, String> {
     let cfg = {
@@ -147,12 +168,17 @@ async fn list_folders(
 
     // 2. Server refresh in the background; UI gets the result via channel.
     let acc2 = acc.clone();
+    let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = match mail::list_folders(&acc2).await {
             Ok(fresh) => {
                 if let Ok(mut store) = store::Store::open(&acc2) {
                     let _ = store.store_folders(&fresh);
                 }
+                // A successful round trip proves we are online — push any
+                // offline read/unread changes to the server.
+                let app3 = app2.clone();
+                tauri::async_runtime::spawn_blocking(move || flush_pending_flags(&app3));
                 Ok(fresh)
             }
             Err(e) => {
@@ -174,6 +200,7 @@ async fn list_messages(
     account: String,
     folder: String,
     on_batch: tauri::ipc::Channel<Vec<mail::MessageSummary>>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cfg = {
@@ -192,24 +219,36 @@ async fn list_messages(
     }
 
     // 2. Refresh from the server, streaming batches; each batch is also
-    //    persisted so the cache stays warm for the next launch.
+    //    persisted so the cache stays warm for the next launch. The final
+    //    on_reconcile callback receives the server's full UID set — capture
+    //    it so we can diff it against the notified set afterwards.
     let acc2 = acc.clone();
     let folder2 = folder.clone();
     let store_channel = on_batch.clone();
     let acc3 = acc.clone();
     let folder3 = folder.clone();
+    let reconciled: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reconciled2 = reconciled.clone();
     let result = mail::list_messages_streamed(
         &acc,
         &folder,
-        move |batch| {
+        move |batch, bodies| {
             if let Ok(mut s) = store::Store::open(&acc2) {
                 if let Err(e) = s.upsert_summaries(&folder2, &batch) {
                     log::warn!("cache upsert failed: {e}");
+                }
+                // Warm the body cache: the full bodies were downloaded to
+                // build the snippets, so store them and make opening any
+                // listed message a cache hit.
+                if let Err(e) = s.store_bodies(&folder2, &bodies) {
+                    log::warn!("body cache write failed: {e}");
                 }
             }
             let _ = store_channel.send(batch);
         },
         move |server_uids| {
+            *reconciled2.lock().unwrap() = server_uids.iter().copied().collect();
             // Remove cache rows for UIDs that vanished from the server.
             if let Ok(mut s) = store::Store::open(&acc3) {
                 match s.remove_uids_not_in(&folder3, &server_uids) {
@@ -219,6 +258,11 @@ async fn list_messages(
                     Ok(_) => {}
                     Err(e) => log::warn!("reconcile failed: {e}"),
                 }
+                // Pending offline flag changes for vanished messages have
+                // nothing left to sync.
+                if let Err(e) = s.remove_pending_uids_not_in(&folder3, &server_uids) {
+                    log::warn!("pending-flag reconcile failed: {e}");
+                }
             }
         },
     )
@@ -226,7 +270,24 @@ async fn list_messages(
 
     // Report connectivity so the ~offline tag tracks the real state.
     match &result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // New-mail detection, shared with the background inbox poller:
+            // UIDs present on the server but not yet recorded fire exactly
+            // one generic notification (the first check of a folder only
+            // records the baseline).
+            let server_uids = reconciled.lock().unwrap().clone();
+            if let Ok(mut s) = store::Store::open(&acc) {
+                match s.new_uids_since_last_sync(&folder, &server_uids) {
+                    Ok(new) if !new.is_empty() => {
+                        log::info!("{}: {} new message(s), notifying", folder, new.len());
+                        notify_new_mail(&app);
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("new-mail check failed: {e}"),
+                }
+            }
+            Ok(())
+        }
         Err(e) => {
             // Serve-from-cache already happened; report offline instead of
             // failing so the UI can show the tag.
@@ -243,23 +304,40 @@ async fn mark_message(
     uid: u32,
     seen: bool,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let cfg = {
         let c = state.config.lock().unwrap();
         c.accounts.iter().find(|a| a.name == account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
-    mail::set_seen(&acc, &folder, uid, seen).await?;
-    // Keep the local cache in sync with the server flag change.
+    // Apply to the local cache first: offline, reading a message still
+    // marks it read locally, and the change is queued for the server.
     let mut store = store::Store::open(&acc)?;
     store.set_seen(&folder, uid, seen)?;
-    // Update the cached unread badge for this folder.
-    let unread = store
-        .load_summaries(&folder)?
-        .iter()
-        .filter(|m| !m.seen)
-        .count() as u32;
-    store.set_folder_unread(&folder, unread)
+
+    match mail::set_seen(&acc, &folder, uid, seen).await {
+        Ok(server_unread) => {
+            // Synced: nothing pending for this message anymore, and the
+            // badge reflects the server's authoritative count.
+            store.remove_pending_flag(&folder, uid)?;
+            store.set_folder_unread(&folder, server_unread)?;
+            Ok(server_unread)
+        }
+        Err(e) => {
+            // Offline: queue the change; the poller flushes the queue once
+            // a connection is back. Badge gets a best-effort local count,
+            // corrected by the next online folder refresh.
+            log::warn!("mark {folder}/{uid} seen={seen} failed (queued): {e}");
+            store.upsert_pending_flag(&folder, uid, seen)?;
+            let local_unread = store
+                .load_summaries(&folder)?
+                .iter()
+                .filter(|m| !m.seen)
+                .count() as u32;
+            store.set_folder_unread(&folder, local_unread)?;
+            Ok(local_unread)
+        }
+    }
 }
 
 #[tauri::command]
@@ -283,18 +361,18 @@ async fn fetch_message(
         }
     }
 
-    // Not cached: fetch from IMAP and persist body + attachment metadata.
-    let body = mail::fetch_message(&acc, &folder, uid).await?;
-    let attachments = mail::fetch_attachments_meta(&acc, &folder, uid).await?;
+    // Not cached: fetch body + attachment metadata in a single connection,
+    // then persist both so the next open is served from the cache.
+    let fetched = mail::fetch_message_full(&acc, &folder, uid).await?;
     let mut store = store::Store::open(&acc)?;
     store.store_body(
         &folder,
         uid,
-        body.text.as_deref(),
-        body.html.as_deref(),
-        &attachments,
+        fetched.body.text.as_deref(),
+        fetched.body.html.as_deref(),
+        &fetched.attachments,
     )?;
-    Ok(body)
+    Ok(fetched.body)
 }
 
 #[tauri::command]
@@ -476,6 +554,169 @@ fn open_private_file(path: &str) -> std::io::Result<std::fs::File> {
     }
 }
 
+/// Push queued offline flag changes to the server. Called whenever the app
+/// proves it is online (a successful inbox poll, a successful folder
+/// refresh). Runs on a worker thread; each pending change gets its own
+/// connection, and only successful syncs are dropped from the queue.
+fn flush_pending_flags(app: &tauri::AppHandle) {
+    let st = app.state::<AppState>();
+    let accounts = st.config.lock().unwrap().accounts.clone();
+    drop(st);
+    for acc in &accounts {
+        let Ok(mut store) = store::Store::open(acc) else { continue };
+        let pending = match store.pending_flags() {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("pending-flag read failed for {}: {e}", acc.email);
+                continue;
+            }
+        };
+        for (folder, uid, seen) in pending {
+            match mail::set_seen_blocking(acc, &folder, uid, seen) {
+                Ok(_) => {
+                    log::info!("synced offline flag {folder}/{uid} seen={seen}");
+                    if let Err(e) = store.remove_pending_flag(&folder, uid) {
+                        log::warn!("pending-flag removal failed: {e}");
+                    }
+                }
+                Err(e) => log::debug!("pending flag {folder}/{uid} still unsynced: {e}"),
+            }
+        }
+    }
+}
+
+/// Find the folder that plays the role of the inbox: prefer the server's
+/// declared \Inbox special-use, then a name match on "INBOX", then any
+/// folder containing "inbox". Returns None when the folder list is
+/// unreachable (offline) or no inbox-like folder exists.
+fn inbox_folder_name(acc: &AccountConfig) -> Option<String> {
+    let folders = match mail::list_folders_blocking(acc) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("inbox poll: folder list failed for {}: {e}", acc.email);
+            return None;
+        }
+    };
+    folders
+        .iter()
+        .find(|f| f.special_use.as_deref() == Some("inbox"))
+        .map(|f| f.name.clone())
+        .or_else(|| {
+            folders
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case("INBOX"))
+                .map(|f| f.name.clone())
+        })
+        .or_else(|| {
+            folders
+                .iter()
+                .find(|f| f.name.to_lowercase().contains("inbox"))
+                .map(|f| f.name.clone())
+        })
+}
+
+/// One poll cycle: check every account's inbox for new mail and notify.
+/// Runs on the poller thread; never touches the UI directly. Emits
+/// `mail-refresh` afterwards so the frontend reloads folders + messages in
+/// the same cycle as any notification.
+fn poll_inboxes(app: &tauri::AppHandle) {
+    let st = app.state::<AppState>();
+    let accounts = st.config.lock().unwrap().accounts.clone();
+    let mut connected = false;
+    if !accounts.is_empty() {
+        for acc in accounts {
+            let Some(inbox) = inbox_folder_name(&acc) else {
+                continue;
+            };
+            match mail::list_folder_uids(&acc, &inbox) {
+                Ok(uids) => {
+                    connected = true;
+                    if let Ok(mut s) = store::Store::open(&acc) {
+                        match s.new_uids_since_last_sync(&inbox, &uids) {
+                            Ok(new) if !new.is_empty() => {
+                                log::info!(
+                                    "inbox poll: {} new message(s) for {} ({inbox})",
+                                    new.len(),
+                                    acc.email
+                                );
+                                notify_new_mail(app);
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("inbox poll: new-mail check failed: {e}"),
+                        }
+                    }
+                }
+                Err(e) => log::warn!("inbox poll failed for {}: {e}", acc.email),
+            }
+        }
+    }
+    // We just proved connectivity: push any offline flag changes to the
+    // server (read/unread made while disconnected) BEFORE telling the UI
+    // to refresh, so the refreshed badges reflect the synced flags.
+    if connected {
+        flush_pending_flags(app);
+    }
+
+    // Tell the UI to refresh regardless of whether anything was new — this
+    // is the app's auto-refresh pulse (unread badges, message list, offline
+    // state all ride on it). The frontend only acts when it is online.
+    let _ = app.emit("mail-refresh", ());
+}
+
+/// Background INBOX poller — the single refresh driver for the whole app.
+/// Every `refresh_interval_minutes` (config, default 1, 0 = off) it checks
+/// every account's inbox for new mail and fires a silent notification when
+/// new mail arrives; after each cycle it emits a `mail-refresh` event so the
+/// frontend reloads folders + the visible message list in the same tick —
+/// the notification and the list refresh are therefore always in sync, and
+/// the UI auto-refresh and the background poll share one interval.
+///
+/// A short tick with elapsed-time bookkeeping (rather than sleeping the
+/// whole interval) means interval changes in config.toml — including 0 →
+/// on — take effect within seconds instead of at the next long sleep.
+fn spawn_inbox_poller(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::time::Instant;
+        // First poll ~5 s after startup, then on the configured cadence.
+        let mut last_poll = Instant::now() - Duration::from_secs(55);
+        let mut last_interval: Option<u64> = None;
+        loop {
+            let st = app.state::<AppState>();
+            let minutes = st.config.lock().unwrap().refresh_interval_minutes;
+            drop(st);
+            let interval = minutes.min(24 * 60);
+            if interval != last_interval.unwrap_or(interval) {
+                log::info!("refresh interval set to {interval} minute(s)");
+                last_interval = Some(interval);
+            }
+            if interval > 0 && last_poll.elapsed() >= Duration::from_secs(interval * 60) {
+                last_poll = Instant::now();
+                poll_inboxes(&app);
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+/// The configured auto-refresh interval in minutes (0 = off).
+#[tauri::command]
+fn get_refresh_interval(state: State<AppState>) -> u64 {
+    state.config.lock().unwrap().refresh_interval_minutes
+}
+
+/// Persist the auto-refresh interval (minutes, 0 = off). Clamped so a
+/// nonsense value can't disable polling forever by accident.
+#[tauri::command]
+fn set_refresh_interval(minutes: u64, state: State<AppState>) -> Result<(), String> {
+    let minutes = minutes.min(24 * 60);
+    let mut cfg = state.config.lock().unwrap();
+    cfg.refresh_interval_minutes = minutes;
+    let result = cfg.save();
+    drop(cfg);
+    log::info!("refresh interval set to {minutes} minute(s)");
+    result
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();    let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
@@ -499,8 +740,13 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             config: Mutex::new(config),
+        })
+        .setup(|app| {
+            spawn_inbox_poller(app.handle().clone());
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_accounts,
@@ -514,7 +760,9 @@ fn main() {
             save_attachment,
             move_message,
             delete_message,
-            send_email
+            send_email,
+            get_refresh_interval,
+            set_refresh_interval
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

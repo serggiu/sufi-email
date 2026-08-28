@@ -104,6 +104,32 @@ impl Store {
                  filename  TEXT,
                  mime      TEXT,
                  size      INTEGER
+             );
+             -- UIDs we have already notified the user about (new-mail
+             -- notifications), one row per message. Shared by the
+             -- background inbox poller and the folder-fetch path, so a
+             -- message never gets two notifications for the same folder.
+             CREATE TABLE IF NOT EXISTS notified_uids (
+                 folder TEXT NOT NULL,
+                 uid    INTEGER NOT NULL,
+                 PRIMARY KEY (folder, uid)
+             );
+             -- Whether the first sync of a folder has happened yet. On the
+             -- first check we record the existing UIDs as a baseline and do
+             -- NOT notify, so an old mailbox with hundreds of messages does
+             -- not spam notifications on first launch.
+             CREATE TABLE IF NOT EXISTS notified_meta (
+                 folder   TEXT PRIMARY KEY,
+                 baseline INTEGER NOT NULL DEFAULT 0
+             );
+             -- Read/unread flag changes made while offline. Applied to the
+             -- local cache immediately, flushed to the server once a
+             -- connection comes back.
+             CREATE TABLE IF NOT EXISTS pending_flags (
+                 folder TEXT NOT NULL,
+                 uid    INTEGER NOT NULL,
+                 seen   INTEGER NOT NULL,
+                 PRIMARY KEY (folder, uid)
              );",
         )
         .map_err(|e| e.to_string())?;
@@ -263,6 +289,26 @@ impl Store {
     }
 
     /// Cached bodies for one message; None when we haven't cached it yet.
+    /// Cache message bodies harvested while streaming a folder list — the
+    /// full bodies are already on the wire for snippets, so persisting them
+    /// here makes opening any listed message a cache hit.
+    pub fn store_bodies(&mut self, folder: &str, bodies: &[crate::mail::BatchBody]) -> Result<(), String> {
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare("UPDATE messages SET body_text = ?1, body_html = ?2 WHERE folder = ?3 AND uid = ?4")
+                .map_err(|e| e.to_string())?;
+            for b in bodies {
+                stmt.execute(rusqlite::params![b.text, b.html, folder, b.uid as i64])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn load_body(
         &self,
         folder: &str,
@@ -417,6 +463,160 @@ impl Store {
         let _ = fs::remove_file(Self::db_path(acc));
         let _ = fs::remove_file(Self::db_path(acc).with_extension("db-wal"));
         let _ = fs::remove_file(Self::db_path(acc).with_extension("db-shm"));
+    }
+
+    // ---------------------------------------------------- new-mail tracking
+    //
+    // The notified_uids table records which message UIDs the user has
+    // already been notified about, per folder. Both the background inbox
+    // poller and the folder-fetch path share it, so a message can never
+    // produce two notifications. The notified_meta.baseline flag separates
+    // "first ever check of this folder" (record everything, notify
+    // nothing) from later checks (notify only genuinely new UIDs) — even
+    // when the folder was empty on first check.
+
+    /// UIDs already recorded for a folder.
+    pub fn notified_uids(&self, folder: &str) -> Result<std::collections::HashSet<u32>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid FROM notified_uids WHERE folder = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<std::collections::HashSet<i64>, _>>()
+            .map(|s| s.into_iter().map(|u| u as u32).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Record UIDs as already notified (insert-or-ignore).
+    pub fn mark_notified(&mut self, folder: &str, uids: &[u32]) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO notified_uids (folder, uid) VALUES (?1, ?2)")
+                .map_err(|e| e.to_string())?;
+            for &uid in uids {
+                stmt.execute(rusqlite::params![folder, uid as i64])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Whether the first check of a folder has happened yet.
+    pub fn notified_baseline(&self, folder: &str) -> Result<bool, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT baseline FROM notified_meta WHERE folder = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(rusqlite::params![folder])
+            .map_err(|e| e.to_string())?;
+        match rows.next().map_err(|e| e.to_string())? {
+            Some(row) => Ok(row.get::<_, i64>(0).map_err(|e| e.to_string())? != 0),
+            None => Ok(false),
+        }
+    }
+
+    fn set_notified_baseline(&mut self, folder: &str, baseline: bool) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO notified_meta (folder, baseline) VALUES (?1, ?2)
+                 ON CONFLICT(folder) DO UPDATE SET baseline = excluded.baseline",
+                rusqlite::params![folder, baseline as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Diff `server_uids` against what we have already notified about.
+    ///
+    /// The first call for a folder records the existing UIDs as a baseline
+    /// and returns nothing (pre-existing mail must not notify). Later calls
+    /// return the UIDs present now but not recorded before, and record them,
+    /// so the caller can fire exactly one notification per batch of new mail.
+    pub fn new_uids_since_last_sync(
+        &mut self,
+        folder: &str,
+        server_uids: &[u32],
+    ) -> Result<Vec<u32>, String> {
+        if !self.notified_baseline(folder)? {
+            self.set_notified_baseline(folder, true)?;
+            self.mark_notified(folder, server_uids)?;
+            return Ok(Vec::new());
+        }
+        let known = self.notified_uids(folder)?;
+        let new: Vec<u32> = server_uids
+            .iter()
+            .copied()
+            .filter(|u| !known.contains(u))
+            .collect();
+        if !new.is_empty() {
+            self.mark_notified(folder, &new)?;
+        }
+        Ok(new)
+    }
+
+    // ---------------------------------------------------- offline flag sync
+
+    /// Record a read/unread change that the server hasn't seen yet (made
+    /// while offline). Replaces any previous pending state for the message.
+    pub fn upsert_pending_flag(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        seen: bool,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO pending_flags (folder, uid, seen) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(folder, uid) DO UPDATE SET seen = excluded.seen",
+                rusqlite::params![folder, uid as i64, seen as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Drop a pending flag once it has been synced to the server.
+    pub fn remove_pending_flag(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_flags WHERE folder = ?1 AND uid = ?2",
+                rusqlite::params![folder, uid as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// All pending flag changes, as (folder, uid, seen).
+    pub fn pending_flags(&self) -> Result<Vec<(String, u32, bool)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folder, uid, seen FROM pending_flags")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)? != 0)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map(|v| v.into_iter().map(|(f, u, s)| (f, u as u32, s)).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drop pending flags for messages that no longer exist on the server
+    /// (they were deleted/moved elsewhere, so there is nothing to sync).
+    pub fn remove_pending_uids_not_in(
+        &mut self,
+        folder: &str,
+        server_uids: &std::collections::HashSet<u32>,
+    ) -> Result<(), String> {
+        let pending = self.pending_flags()?;
+        for (pf, uid, _) in pending {
+            if pf == folder && !server_uids.contains(&uid) {
+                self.remove_pending_flag(&folder, uid)?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -215,7 +215,12 @@ button:hover { background: var(--bg-hover); }
   cursor: pointer;
 }
 #message-list li:hover { background: var(--bg-hover); }
-#message-list li.selected { background: var(--bg-active); }
+#message-list li.selected {
+  background: var(--bg-active);
+  /* Subtle accent cue that this row is the open message, in the same
+     family as the hover tint but clearly "current". */
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .msg-top {
   display: flex;
   justify-content: space-between;

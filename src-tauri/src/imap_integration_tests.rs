@@ -144,7 +144,7 @@ fn list_messages_streams_summaries_newest_first() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             move |uids| {
@@ -192,7 +192,7 @@ fn list_messages_reconciles_deleted_uids() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             move |uids| {
@@ -214,7 +214,7 @@ fn list_messages_empty_mailbox_streams_nothing() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             |_| {},
@@ -238,7 +238,7 @@ fn list_messages_empty_mailbox_still_reconciles() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             move |uids| {
@@ -263,7 +263,7 @@ fn list_messages_empty_mailbox_still_reconciles() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx2.send(batch);
             },
             move |uids| {
@@ -290,7 +290,8 @@ fn fetch_message_returns_parsed_plain_text_body() {
         state.add_message("INBOX", FakeMessage::new(0, "Hello", "a@b.com", 1, false));
         let acc = test_account(&state, "Fetch");
 
-        let body = block_on(crate::mail::fetch_message(&acc, "INBOX", 1)).expect("fetch");
+        let fetched = block_on(crate::mail::fetch_message_full(&acc, "INBOX", 1)).expect("fetch");
+        let body = fetched.body;
         assert_eq!(body.uid, 1);
         let text = body.text.expect("plain text part");
         assert!(text.contains("Body of 'Hello'"));
@@ -307,7 +308,7 @@ fn fetch_message_for_missing_uid_errors() {
     with_config_dir(|_| {
         let state = FakeMailboxState::new();
         let acc = test_account(&state, "Missing");
-        let err = block_on(crate::mail::fetch_message(&acc, "INBOX", 99))
+        let err = block_on(crate::mail::fetch_message_full(&acc, "INBOX", 99))
             .expect_err("missing uid must error");
         assert!(err.contains("not found"), "unexpected error: {err}");
     });
@@ -318,14 +319,14 @@ fn fetch_message_unknown_folder_errors() {
     with_config_dir(|_| {
         let state = FakeMailboxState::new();
         let acc = test_account(&state, "NoFolder");
-        let err = block_on(crate::mail::fetch_message(&acc, "DoesNotExist", 1))
+        let err = block_on(crate::mail::fetch_message_full(&acc, "DoesNotExist", 1))
             .expect_err("unknown folder must error");
         assert!(!err.is_empty());
     });
 }
 
 #[test]
-fn fetch_attachments_meta_parses_mime_attachment() {
+fn fetch_message_full_parses_mime_attachment() {
     with_config_dir(|_| {
         let state = FakeMailboxState::new();
         state.add_message(
@@ -334,8 +335,9 @@ fn fetch_attachments_meta_parses_mime_attachment() {
         );
         let acc = test_account(&state, "Att");
 
-        let atts = block_on(crate::mail::fetch_attachments_meta(&acc, "INBOX", 1))
-            .expect("attachment meta");
+        let fetched = block_on(crate::mail::fetch_message_full(&acc, "INBOX", 1))
+            .expect("fetch");
+        let atts = fetched.attachments;
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].filename, "report.pdf");
         assert_eq!(atts[0].content_type, "application/pdf");
@@ -361,7 +363,7 @@ fn summary_reports_has_attachment_from_bodystructure() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             |_| {},
@@ -388,10 +390,12 @@ fn set_seen_toggles_server_flag() {
         let acc = test_account(&state, "Seen");
         assert!(!state.is_seen("INBOX", 1), "starts unseen");
 
-        block_on(crate::mail::set_seen(&acc, "INBOX", 1, true)).expect("mark seen");
+        let unseen = block_on(crate::mail::set_seen(&acc, "INBOX", 1, true)).expect("mark seen");
+        assert_eq!(unseen, 0, "the only message is now seen");
         assert!(state.is_seen("INBOX", 1), "\\Seen set on the server");
 
-        block_on(crate::mail::set_seen(&acc, "INBOX", 1, false)).expect("mark unseen");
+        let unseen = block_on(crate::mail::set_seen(&acc, "INBOX", 1, false)).expect("mark unseen");
+        assert_eq!(unseen, 1, "marked unseen again -> 1 unseen");
         assert!(!state.is_seen("INBOX", 1), "\\Seen cleared on the server");
     });
 }
@@ -473,7 +477,7 @@ fn raw_session_sees_same_messages_as_streaming() {
         block_on(crate::mail::list_messages_streamed(
             &acc,
             "INBOX",
-            move |batch| {
+            move |batch, _bodies| {
                 let _ = tx.send(batch);
             },
             |_| {},
