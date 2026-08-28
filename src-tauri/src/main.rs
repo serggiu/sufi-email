@@ -423,8 +423,31 @@ async fn move_message(
     store.delete_message(&folder, uid)
 }
 
+/// Optimistic delete, part 1: remove the message from the local cache
+/// immediately (UI + store). Returns fast; the server call follows in the
+/// background via [`delete_message_server`].
 #[tauri::command]
-async fn delete_message(
+async fn delete_message_local(
+    account: String,
+    folder: String,
+    uid: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cfg = {
+        let c = state.config.lock().unwrap();
+        c.accounts.iter().find(|a| a.name == account).cloned()
+    };
+    let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
+    let mut store = store::Store::open(&acc)?;
+    store.delete_message(&folder, uid)
+}
+
+/// Optimistic delete, part 2: the actual server-side delete (move to Trash,
+/// or \Deleted + expunge when there is no Trash). Runs in the background;
+/// a failure surfaces in the UI and the message reappears on the next
+/// folder sync (the reconcile re-adds UIDs still on the server).
+#[tauri::command]
+async fn delete_message_server(
     account: String,
     folder: String,
     uid: u32,
@@ -447,9 +470,7 @@ async fn delete_message(
             mail::delete_message(&acc, &folder, uid).await?;
         }
     }
-
-    let mut store = store::Store::open(&acc)?;
-    store.delete_message(&folder, uid)
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -910,7 +931,8 @@ fn main() {
             list_attachments,
             save_attachment,
             move_message,
-            delete_message,
+            delete_message_local,
+            delete_message_server,
             send_email
         ])
         .run(tauri::generate_context!())
@@ -932,5 +954,28 @@ mod main_tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "saved attachments must be owner-only");
         }
+    }
+}
+
+#[cfg(test)]
+mod manual_send_tests {
+    use tauri::async_runtime::block_on;
+
+    /// Manual check: sends a real email through the configured SMTP account
+    /// (to itself). Run with: cargo test -- --ignored manual_send
+    #[test]
+    #[ignore]
+    fn manual_send_test_email() {
+        let cfg = crate::account::Config::load_or_default();
+        let acc = cfg.accounts.first().expect("no configured account");
+        let to = acc.email.clone();
+        block_on(crate::mail::send_email(
+            acc,
+            vec![to.clone()],
+            "sufi-email send test",
+            "hello from the manual send test",
+        ))
+        .expect("send failed");
+        println!("sent to {to}");
     }
 }

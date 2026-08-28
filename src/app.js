@@ -553,31 +553,90 @@ function findTrashFolder() {
   );
 }
 
+/* ---------- confirm dialog ---------- */
+
+// Show a modal confirmation; resolves true when the user clicks OK.
+function confirmDialog(title, message, okLabel) {
+  return new Promise((resolve) => {
+    const dlg = $("confirm-dialog");
+    $("confirm-title").textContent = title;
+    $("confirm-message").textContent = message;
+    $("confirm-ok").textContent = okLabel || "OK";
+    const ok = () => {
+      cleanup();
+      resolve(true);
+    };
+    const cancel = () => {
+      cleanup();
+      resolve(false);
+    };
+    const cleanup = () => {
+      dlg.removeEventListener("click", onClick);
+      $("confirm-ok").removeEventListener("click", ok);
+      $("confirm-cancel").removeEventListener("click", cancel);
+      dlg.close();
+    };
+    // Clicking the backdrop cancels too.
+    const onClick = (e) => {
+      if (e.target === dlg) cancel();
+    };
+    dlg.addEventListener("click", onClick);
+    $("confirm-ok").addEventListener("click", ok);
+    $("confirm-cancel").addEventListener("click", cancel);
+    dlg.showModal();
+  });
+}
+
 async function deleteMessage(uid) {
   const trash = findTrashFolder();
+  // Without a Trash folder the server delete is permanent and cannot be
+  // undone — ask first.
+  if (!trash) {
+    const proceed = await confirmDialog(
+      "Delete permanently?",
+      "No Trash folder exists for this account — the message will be " +
+        "permanently deleted from the server and cannot be recovered.",
+      "Delete"
+    );
+    if (!proceed) return;
+  }
+  // 1. Remove from the UI + local cache right away (fast local call).
   try {
-    await invoke("delete_message", {
+    await invoke("delete_message_local", {
       account: state.account.name,
       folder: state.folder,
       uid,
-      trashFolder: trash ? trash.name : null,
     });
-    // Remove locally and clear the preview if it was showing this message.
-    state.messages = state.messages.filter((m) => m.uid !== uid);
-    renderMessages();
-    if (loadFolderSelection(state.account.name, state.folder) === uid) {
-      clearFolderSelection(state.account.name, state.folder);
-    }
-    // Badges come from the server, not a local recompute over a possibly-
-    // incomplete message list.
-    loadFolders();
-    if (state.selectedUid === uid) {
-      state.selectedUid = null;
-      renderPreviewEmpty();
-    }
   } catch (e) {
     showError(String(e));
+    return;
   }
+
+  // Adjust the unread badge locally (corrected by loadFolders below).
+  const f = state.folders.find((x) => x.name === state.folder);
+  const msg = state.messages.find((m) => m.uid === uid);
+  if (f && msg && !msg.seen) f.unread = Math.max(0, (f.unread || 0) - 1);
+
+  state.messages = state.messages.filter((m) => m.uid !== uid);
+  renderMessages();
+  if (loadFolderSelection(state.account.name, state.folder) === uid) {
+    clearFolderSelection(state.account.name, state.folder);
+  }
+  if (state.selectedUid === uid) {
+    state.selectedUid = null;
+    renderPreviewEmpty();
+  }
+  // Badges come from the server (the local estimate above is corrected here).
+  loadFolders();
+
+  // 2. Server delete in the background — the UI is already updated. If it
+  // fails, the message reappears on the next folder sync.
+  invoke("delete_message_server", {
+    account: state.account.name,
+    folder: state.folder,
+    uid,
+    trashFolder: trash ? trash.name : null,
+  }).catch((e) => showError("Server delete failed: " + e));
 }
 
 function openMoveDialog(uid) {
@@ -757,30 +816,54 @@ function openCompose(replyTo) {
   dlg.showModal();
 }
 
+let sendStatusTimer = null;
+
+// Transient send progress in the toolbar: "Sending…", then "Sent ✓" or
+// an error. Auto-clears after a few seconds.
+function showSendStatus(msg, isError) {
+  const el = $("send-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle("error", !!isError);
+  el.classList.remove("hidden");
+  clearTimeout(sendStatusTimer);
+  sendStatusTimer = setTimeout(() => {
+    el.classList.add("hidden");
+    el.textContent = "";
+  }, isError ? 8000 : 4000);
+}
+
 async function sendCompose(e) {
   e.preventDefault();
   const to = $("compose-to").value
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const btn = $("compose-send");
-  btn.disabled = true;
+  const subject = $("compose-subject").value;
+  const body = $("compose-body").value;
+
+  // Close the modal right away — the SMTP round trip takes seconds, and
+  // the user should not stare at a frozen dialog.
+  $("compose-dialog").close();
+  showSendStatus("Sending…");
   try {
     await invoke("send_email", {
       args: {
         account: state.account.name,
         to,
-        subject: $("compose-subject").value,
-        body: $("compose-body").value,
+        subject,
+        body,
       },
     });
-    $("compose-dialog").close();
+    showSendStatus("Sent ✓");
   } catch (err) {
-    const box = $("compose-error");
-    box.textContent = String(err);
-    box.classList.remove("hidden");
-  } finally {
-    btn.disabled = false;
+    showSendStatus("Send failed: " + err, true);
+    // Reopen with the content intact so nothing typed is lost on a
+    // transient failure.
+    $("compose-to").value = to.join(", ");
+    $("compose-subject").value = subject;
+    $("compose-body").value = body;
+    $("compose-dialog").showModal();
   }
 }
 

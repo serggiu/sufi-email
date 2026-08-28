@@ -16,11 +16,13 @@
           <div id="accounts-menu" class="hidden"></div>
         </div>
         <span id="account-label"></span>
+        <span id="send-status" class="hidden"></span>
         <span class="spacer"></span>
         <div id="font-controls">
           <button id="font-dec" title="Decrease font size">A−</button>
           <button id="font-inc" title="Increase font size">A+</button>
         </div>
+        <span id="send-status" class="hidden"></span>
         <div id="refresh-wrap">
           <button id="refresh-btn" title="Refresh now">⟳ Refresh</button>
         </div>
@@ -114,6 +116,17 @@
           <ul id="move-folder-list"></ul>
           <div class="dialog-buttons">
             <button type="button" id="move-cancel">Cancel</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="confirm-dialog">
+        <form id="confirm-form" method="dialog">
+          <h2 id="confirm-title">Are you sure?</h2>
+          <p id="confirm-message"></p>
+          <div class="dialog-buttons">
+            <button type="button" id="confirm-cancel">Cancel</button>
+            <button type="button" id="confirm-ok" class="danger">Delete</button>
           </div>
         </form>
       </dialog>
