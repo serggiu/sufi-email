@@ -120,6 +120,21 @@
         </form>
       </dialog>
 
+      <dialog id="message-modal">
+        <div id="modal-header">
+          <div id="modal-subject"></div>
+          <button id="modal-close" title="Close (Esc)">✕</button>
+        </div>
+        <div id="modal-meta"></div>
+        <div id="modal-actions">
+          <button id="modal-reply">↩ Reply</button>
+          <button id="modal-move">→ Move</button>
+          <button id="modal-delete" class="danger">✕ Delete</button>
+        </div>
+        <div id="modal-attachment-list" class="hidden"></div>
+        <iframe id="modal-frame" sandbox=""></iframe>
+      </dialog>
+
       <dialog id="confirm-dialog">
         <form id="confirm-form" method="dialog">
           <h2 id="confirm-title">Are you sure?</h2>

@@ -1,3 +1,16 @@
+import {
+  loadLastSelection,
+  loadFolderSelection,
+  saveSelection,
+  clearFolderSelection,
+} from "./lib/selection.js";
+import { fmtDate, fmtSize, escapeHtml, withEmailCsp } from "./lib/format.js";
+import {
+  renderViewSubject,
+  renderViewMeta,
+  renderViewBody,
+} from "./lib/mailview.js";
+
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
 
 const state = {
@@ -28,16 +41,6 @@ function guardTauri() {
   return false;
 }
 
-function fmtDate(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const today = new Date();
-  if (d.toDateString() === today.toDateString()) {
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  }
-  return d.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
 /* ---------- folders ---------- */
 
 async function loadFolders() {
@@ -55,7 +58,7 @@ async function loadFolders() {
       // On first load open the folder the last message was read in; the
       // message itself is restored once its list has rendered.
       if (!state.folder) {
-        const saved = loadLastSelection();
+        const saved = loadLastSelection(localStorage);
         const target =
           (saved && state.folders.find((f) => f.name === saved.folder)) ||
           state.folders.find(
@@ -214,74 +217,6 @@ async function selectFolder(name) {
   await loadMessages();
 }
 
-/* ---------- last-selected message ---------- */
-
-// Remember the last message opened in each account+folder, plus which one
-// was most recently used (for launch restore). Switching folders re-opens
-// the message you last had open there; launching reopens the last one
-// overall.
-const SELECTION_KEY = "sufi-selections";
-
-function loadSelectionRaw() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SELECTION_KEY));
-    if (raw && typeof raw === "object") {
-      // Migrate the old single-selection format { account, folder, uid }.
-      if (raw.account && raw.folder && Number.isFinite(raw.uid)) {
-        const key = selectionKey(raw.account, raw.folder);
-        return { lastKey: key, folders: { [key]: raw.uid } };
-      }
-      if (raw.folders && typeof raw.folders === "object") return raw;
-    }
-  } catch (_) {}
-  return { lastKey: null, folders: {} };
-}
-
-function selectionKey(account, folder) {
-  return account + "::" + folder;
-}
-
-function saveSelection(account, folder, uid) {
-  const sel = loadSelectionRaw();
-  sel.folders[selectionKey(account, folder)] = uid;
-  sel.lastKey = selectionKey(account, folder);
-  try {
-    localStorage.setItem(SELECTION_KEY, JSON.stringify(sel));
-  } catch (_) {}
-}
-
-// Most recent selection overall — used to reopen the app where you left off.
-function loadLastSelection() {
-  const sel = loadSelectionRaw();
-  const key = sel.lastKey;
-  if (!key || !(key in sel.folders)) return null;
-  const sep = key.indexOf("::");
-  return {
-    account: key.slice(0, sep),
-    folder: key.slice(sep + 2),
-    uid: sel.folders[key],
-  };
-}
-
-// The last message opened in a specific account+folder, or null.
-function loadFolderSelection(account, folder) {
-  const sel = loadSelectionRaw();
-  return sel.folders[selectionKey(account, folder)] ?? null;
-}
-
-// Forget a folder's remembered message (when it was deleted/moved away).
-function clearFolderSelection(account, folder) {
-  const sel = loadSelectionRaw();
-  const key = selectionKey(account, folder);
-  if (key in sel.folders) {
-    delete sel.folders[key];
-    if (sel.lastKey === key) sel.lastKey = null;
-    try {
-      localStorage.setItem(SELECTION_KEY, JSON.stringify(sel));
-    } catch (_) {}
-  }
-}
-
 /* ---------- message list ---------- */
 
 function showListLoading(text) {
@@ -396,6 +331,8 @@ function renderMessages() {
     }
 
     li.addEventListener("click", () => selectMessage(m.uid, li));
+    // Double-click: full-width message details modal.
+    li.addEventListener("dblclick", () => openMessageModal(m.uid));
     li.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, m.uid);
@@ -409,7 +346,7 @@ function renderMessages() {
 // on every completed load but no-ops once the message is already selected,
 // so auto-refresh cycles don't re-fetch its body.
 function restoreSelection() {
-  const savedUid = loadFolderSelection(state.account.name, state.folder);
+  const savedUid = loadFolderSelection(localStorage, state.account.name, state.folder);
   if (savedUid == null || state.selectedUid === savedUid) return;
   const msg = state.messages.find((m) => m.uid === savedUid);
   if (!msg) return;
@@ -462,7 +399,7 @@ async function setSeen(uid, seen) {
 
 async function selectMessage(uid, li) {
   state.selectedUid = uid;
-  saveSelection(state.account.name, state.folder, uid);
+  saveSelection(localStorage, state.account.name, state.folder, uid);
   document
     .querySelectorAll("#message-list li")
     .forEach((el) => el.classList.remove("selected"));
@@ -619,13 +556,15 @@ async function deleteMessage(uid) {
 
   state.messages = state.messages.filter((m) => m.uid !== uid);
   renderMessages();
-  if (loadFolderSelection(state.account.name, state.folder) === uid) {
-    clearFolderSelection(state.account.name, state.folder);
+  if (loadFolderSelection(localStorage, state.account.name, state.folder) === uid) {
+    clearFolderSelection(localStorage, state.account.name, state.folder);
   }
   if (state.selectedUid === uid) {
     state.selectedUid = null;
     renderPreviewEmpty();
   }
+  // If the full-width modal was showing this message, close it.
+  if (modalUid === uid) closeMessageModal();
   // Badges come from the server (the local estimate above is corrected here).
   loadFolders();
 
@@ -666,8 +605,8 @@ async function moveMessage(uid, destFolder) {
     });
     state.messages = state.messages.filter((m) => m.uid !== uid);
     renderMessages();
-    if (loadFolderSelection(state.account.name, state.folder) === uid) {
-      clearFolderSelection(state.account.name, state.folder);
+    if (loadFolderSelection(localStorage, state.account.name, state.folder) === uid) {
+      clearFolderSelection(localStorage, state.account.name, state.folder);
     }
     // Badges come from the server, not a local recompute over a possibly-
     // incomplete message list.
@@ -676,6 +615,7 @@ async function moveMessage(uid, destFolder) {
       state.selectedUid = null;
       renderPreviewEmpty();
     }
+    if (modalUid === uid) closeMessageModal();
   } catch (e) {
     showError(String(e));
   }
@@ -683,51 +623,27 @@ async function moveMessage(uid, destFolder) {
 
 /* ---------- preview ---------- */
 
-function renderPreviewEmpty() {
-  $("preview-empty").classList.remove("hidden");
-  $("preview-content").classList.add("hidden");
-}
+// The message-details view is shared between the three-column preview and
+// the full-width message modal: both render subject / meta / body / attachments
+// through the same functions, so a future change to the message view updates
+// both places. A "view" is just the set of elements to render into.
+const columnView = {
+  empty: $("preview-empty"),
+  content: $("preview-content"),
+  subject: $("preview-subject"),
+  meta: $("preview-meta"),
+  frame: $("preview-frame"),
+  attachments: $("attachment-list"),
+};
+const modalView = {
+  subject: $("modal-subject"),
+  meta: $("modal-meta"),
+  frame: $("modal-frame"),
+  attachments: $("modal-attachment-list"),
+};
 
-function renderPreview(body) {
-  const summary = state.messages.find((m) => m.uid === body.uid) || {};
-  $("preview-empty").classList.add("hidden");
-  $("preview-content").classList.remove("hidden");
-  $("preview-subject").textContent = summary.subject || "(no subject)";
-  $("preview-meta").textContent = [
-    summary.from || "",
-    summary.date ? new Date(summary.date).toLocaleString() : "",
-  ]
-    .filter(Boolean)
-    .join("  ·  ");
-
-  // Render inside a fully sandboxed iframe (no scripts, no same-origin).
-  // A CSP meta tag additionally blocks remote resources — most importantly
-  // remote images, so tracking pixels in HTML mail cannot phone home.
-  const frame = $("preview-frame");
-  const content =
-    body.html ??
-    `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(
-      body.text ?? "(empty message)"
-    )}</pre>`;
-  frame.srcdoc = withEmailCsp(content);
-
-  loadAttachmentList(body.uid);
-}
-
-// Allow only embedded (data:) images and inline styles; everything else —
-// remote images, web fonts, scripts, frames — is blocked.
-function withEmailCsp(html) {
-  const meta =
-    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'">';
-  const head = /<head[^>]*>/i.exec(html);
-  if (head) {
-    return html.slice(0, head.index + head[0].length) + meta + html.slice(head.index + head[0].length);
-  }
-  return meta + html;
-}
-
-async function loadAttachmentList(uid) {
-  const box = $("attachment-list");
+async function renderViewAttachments(view, uid) {
+  const box = view.attachments;
   box.innerHTML = "";
   box.classList.add("hidden");
   let atts = [];
@@ -766,10 +682,49 @@ async function loadAttachmentList(uid) {
   box.classList.remove("hidden");
 }
 
-function fmtSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+function renderPreviewEmpty() {
+  $("preview-empty").classList.remove("hidden");
+  $("preview-content").classList.add("hidden");
+}
+
+function renderPreview(body) {
+  const summary = state.messages.find((m) => m.uid === body.uid) || {};
+  $("preview-empty").classList.add("hidden");
+  $("preview-content").classList.remove("hidden");
+  renderViewSubject(columnView, summary);
+  renderViewMeta(columnView, summary);
+  renderViewBody(columnView, body);
+  renderViewAttachments(columnView, body.uid);
+}
+
+// Full-width message details modal (opened by double-clicking a row). Uses
+// the same view functions as the three-column preview.
+let modalUid = null;
+
+async function openMessageModal(uid) {
+  modalUid = uid;
+  const summary = state.messages.find((m) => m.uid === uid) || {};
+  try {
+    const body = await invoke("fetch_message", {
+      account: state.account.name,
+      folder: state.folder,
+      uid,
+    });
+    renderViewSubject(modalView, summary);
+    renderViewMeta(modalView, summary);
+    renderViewBody(modalView, body);
+    renderViewAttachments(modalView, uid);
+    $("message-modal").showModal();
+    // Double-clicking is an explicit read: mark immediately.
+    if (summary.seen === false) setSeen(uid, true);
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+function closeMessageModal() {
+  const dlg = $("message-modal");
+  if (dlg.open) dlg.close();
 }
 
 async function saveAttachment(uid, att) {
@@ -788,13 +743,6 @@ async function saveAttachment(uid, att) {
   } catch (e) {
     showError(String(e));
   }
-}
-
-function escapeHtml(s) {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
 }
 
 /* ---------- compose ---------- */
@@ -918,7 +866,7 @@ async function refreshAccounts(preferredName) {
   state.accounts = await invoke("get_accounts");
   // Reopen the account the last message was read in, falling back to the
   // existing preference chain.
-  const saved = loadLastSelection();
+  const saved = loadLastSelection(localStorage);
   const target =
     (saved && state.accounts.find((a) => a.name === saved.account)) ||
     (preferredName && state.accounts.find((a) => a.name === preferredName)) ||
@@ -1193,6 +1141,19 @@ function init() {
     if (state.selectedUid != null) openMoveDialog(state.selectedUid);
   });
   $("move-cancel").addEventListener("click", () => $("move-dialog").close());
+
+  // Full-width message modal.
+  $("modal-close").addEventListener("click", closeMessageModal);
+  $("modal-reply").addEventListener("click", () => {
+    const m = state.messages.find((x) => x.uid === modalUid);
+    if (m) openCompose(m);
+  });
+  $("modal-move").addEventListener("click", () => {
+    if (modalUid != null) openMoveDialog(modalUid);
+  });
+  $("modal-delete").addEventListener("click", () => {
+    if (modalUid != null) deleteMessage(modalUid);
+  });
 
   // Accounts menu
   $("accounts-btn").addEventListener("click", (e) => {

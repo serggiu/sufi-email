@@ -530,3 +530,48 @@ fn pending_seen_map_returns_only_folder_flags() {
     assert_eq!(map.get(&2), Some(&false));
     assert!(!map.contains_key(&3));
 }
+
+// ---------------------------------------------------- body pre-caching
+
+#[test]
+fn store_bodies_caches_and_loads_bodies() {
+    let (_dir, mut store) = test_store("bodies");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+
+    // Nothing cached yet.
+    assert!(store.load_body("INBOX", 1).unwrap().is_none());
+
+    store
+        .store_bodies(
+            "INBOX",
+            &[crate::mail::BatchBody {
+                uid: 1,
+                text: Some("plain".into()),
+                html: Some("<p>html</p>".into()),
+            }],
+        )
+        .unwrap();
+
+    let (text, html) = store.load_body("INBOX", 1).unwrap().expect("cached body");
+    assert_eq!(text.as_deref(), Some("plain"));
+    assert_eq!(html.as_deref(), Some("<p>html</p>"));
+}
+
+#[test]
+fn store_bodies_keeps_previous_body_when_updated() {
+    let (_dir, mut store) = test_store("bodies-update");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    store
+        .store_bodies("INBOX", &[crate::mail::BatchBody { uid: 1, text: Some("v1".into()), html: None }])
+        .unwrap();
+    // A summary refresh must not wipe the cached body.
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, true)])
+        .unwrap();
+    let (text, _html) = store.load_body("INBOX", 1).unwrap().expect("body survives upsert");
+    assert_eq!(text.as_deref(), Some("v1"));
+}

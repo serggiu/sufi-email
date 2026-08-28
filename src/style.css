@@ -496,3 +496,57 @@ dialog textarea { resize: vertical; }
   color: #10131c;
 }
 #confirm-ok.danger:hover { filter: brightness(1.1); }
+
+/* ---- full-width message modal ---- */
+#message-modal {
+  width: 95vw;
+  max-width: none;
+  height: 90vh;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+#modal-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+#modal-subject {
+  flex: 1;
+  font-size: 19px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#modal-close {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+}
+#modal-meta {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border);
+}
+#modal-actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border);
+}
+#modal-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: white;
+}
+#modal-attachment-list { padding: 8px 18px; }
+#modal-attachment-list .att-header,
+#modal-attachment-list .att-item {
+  padding: 6px 0;
+}

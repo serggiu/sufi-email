@@ -378,7 +378,23 @@ fn handle_connection(stream: TcpStream, state: FakeMailboxState) {
                     if items_upper.contains("BODYSTRUCTURE") {
                         resp.push_str(&format!("BODYSTRUCTURE {} ", m.bodystructure()));
                     }
-                    if items_upper.contains("BODY.PEEK[]") || items_upper.contains("BODY[]") {
+                    if items_upper.contains("BODY.PEEK[HEADER]") || items_upper.contains("BODY[HEADER]") {
+                        let raw = m.raw();
+                        // Header = everything up to the blank line.
+                        let header_end = raw
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                            .unwrap_or(raw.len());
+                        let header = &raw[..header_end];
+                        let _ = writer.write_all(prefix.as_bytes());
+                        let _ = writer.write_all(resp.as_bytes());
+                        let _ = writer.write_all(b"BODY[HEADER] {");
+                        let _ = writer.write_all(header.len().to_string().as_bytes());
+                        let _ = writer.write_all(b"}\r\n");
+                        let _ = writer.write_all(header);
+                        let _ = writer.write_all(b")\r\n");
+                    } else if items_upper.contains("BODY.PEEK[]") || items_upper.contains("BODY[]") {
                         let raw = m.raw();
                         let _ = writer.write_all(prefix.as_bytes());
                         let _ = writer.write_all(resp.as_bytes());

@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
-    "vite": "^7.1.0"
+    "jsdom": "^30.0.1",
+    "vite": "^7.1.0",
+    "vitest": "^4.1.11"
   }
 }

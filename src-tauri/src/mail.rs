@@ -109,47 +109,43 @@ pub fn list_folder_uids(acc: &AccountConfig, folder: &str) -> Result<Vec<u32>, S
     Ok(uids)
 }
 
-/// Sender display + subject of one message, from the ENVELOPE on an already
-/// open session — used to build the new-mail notification without doing a
-/// full folder sync.
+/// Sender display + subject of one message, for the new-mail notification.
+/// Fetches the header section and parses it with mail-parser — the exact
+/// same decoding the message list applies (RFC 2047 names/subjects, HTML
+/// stripped, whitespace collapsed), so the toast never shows raw encoded
+/// words or entities.
 pub fn fetch_envelope_preview(
     session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
     uid: u32,
 ) -> Result<(String, String), String> {
     let fetches = session
-        .uid_fetch(format!("{uid}"), "(ENVELOPE)")
+        .uid_fetch(format!("{uid}"), "(BODY.PEEK[HEADER])")
         .map_err(|e| format!("FETCH failed: {e}"))?;
-    let f = fetches
+    let raw = fetches
         .iter()
         .next()
+        .and_then(|f| f.header())
         .ok_or_else(|| format!("message uid {uid} not found"))?;
-    let env = f.envelope().ok_or("no envelope")?;
-    let from = env
-        .from
-        .as_ref()
-        .and_then(|l| l.first())
+    let msg = MessageParser::default().parse(raw).ok_or("unparseable header")?;
+    let from = msg
+        .from()
+        .and_then(|a| a.first())
         .map(address_display)
         .unwrap_or_default();
-    let subject = env
-        .subject
-        .as_ref()
-        .map(|s| collapse_whitespace(&html_to_plain(&decode_imap_utf8(s))))
+    let subject = msg
+        .subject()
+        .map(|s| collapse_whitespace(&html_to_plain(&s.to_string())))
         .unwrap_or_default();
     Ok((from, subject))
 }
 
-fn address_display(a: &imap_proto::types::Address) -> String {
-    let name = a.name.as_ref().map(|n| String::from_utf8_lossy(n).into_owned());
-    let email = a
-        .mailbox
-        .as_ref()
-        .zip(a.host.as_ref())
-        .map(|(m, h)| format!("{}@{}", String::from_utf8_lossy(m), String::from_utf8_lossy(h)));
-    match (name, email) {
-        (Some(n), Some(e)) if !n.is_empty() => format!("{n} <{e}>"),
-        (Some(n), _) => n,
-        (_, Some(e)) => e,
-        _ => String::new(),
+fn address_display(a: &mail_parser::Addr) -> String {
+    let name = a.name().unwrap_or("").trim();
+    let email = a.address().unwrap_or("");
+    if name.is_empty() {
+        email.to_string()
+    } else {
+        format!("{name} <{email}>")
     }
 }
 

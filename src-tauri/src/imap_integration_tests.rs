@@ -496,3 +496,78 @@ fn raw_session_sees_same_messages_as_streaming() {
     });
 }
 
+
+// ---------------------------------------------------------------------------
+// New-mail notification preview
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fetch_envelope_preview_returns_plain_from_and_subject() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        state.add_message(
+            "INBOX",
+            FakeMessage::new(1, "Plain subject", "sender@example.com", 1, false),
+        );
+        let acc = test_account(&state, "Preview");
+        let mut session = crate::mail::imap_session_pub(&acc).expect("session");
+        session.select("INBOX").expect("select");
+
+        let (from, subject) =
+            crate::mail::fetch_envelope_preview(&mut session, 1).expect("preview");
+        assert!(from.contains("sender@example.com"));
+        assert_eq!(subject, "Plain subject");
+    });
+}
+
+#[test]
+fn fetch_envelope_preview_decodes_rfc2047_and_strips_markup() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        // The fake server writes headers verbatim, so encoded words and
+        // markup survive into the raw message exactly like a real server.
+        let mut msg = FakeMessage::new(1, "=?UTF-8?Q?Na=C3=AFve?=", "sender@example.com", 1, false);
+        msg.from_name = "=?UTF-8?B?SsO2aG4=?=".into(); // "Jöhn"
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "PreviewEncoded");
+        let mut session = crate::mail::imap_session_pub(&acc).expect("session");
+        session.select("INBOX").expect("select");
+
+        let (from, subject) =
+            crate::mail::fetch_envelope_preview(&mut session, 1).expect("preview");
+        assert!(from.contains("Jöhn"), "decoded display name, got: {from}");
+        assert!(from.contains("sender@example.com"));
+        assert_eq!(subject, "Naïve", "decoded subject");
+    });
+}
+
+#[test]
+fn fetch_envelope_preview_strips_html_from_subject() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        state.add_message(
+            "INBOX",
+            FakeMessage::new(1, "<b>Bold &amp; clear</b>", "sender@example.com", 1, false),
+        );
+        let acc = test_account(&state, "PreviewHtml");
+        let mut session = crate::mail::imap_session_pub(&acc).expect("session");
+        session.select("INBOX").expect("select");
+
+        let (_from, subject) =
+            crate::mail::fetch_envelope_preview(&mut session, 1).expect("preview");
+        assert_eq!(subject, "Bold & clear", "markup stripped and entities decoded");
+    });
+}
+
+#[test]
+fn fetch_envelope_preview_missing_uid_errors() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let acc = test_account(&state, "PreviewMissing");
+        let mut session = crate::mail::imap_session_pub(&acc).expect("session");
+        session.select("INBOX").expect("select");
+        let err = crate::mail::fetch_envelope_preview(&mut session, 99)
+            .expect_err("missing uid must error");
+        assert!(err.contains("not found"), "unexpected error: {err}");
+    });
+}
