@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Start Sufi Email detached from the terminal: closing the terminal (or an
+# SSH session) does not kill the app — it keeps running in the background
+# with its tray icon. Quit it from the tray menu (right-click -> Quit).
+#
+# Prefers the self-contained release build (no dev server needed). When that
+# isn't built yet, falls back to the dev build (npm run tauri dev), which
+# starts vite + the debug binary. Build the release once with:
+#
+#   bin/build --no-bundle
+#
+# Usage:
+#   bin/start
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/sufi-email/start.log"
+mkdir -p "$(dirname "$LOG")"
+
+RELEASE_BIN="$ROOT/src-tauri/target/release/sufi-email"
+
+# Detect the app binary: release (self-contained) first, then debug (dev).
+if [ -x "$RELEASE_BIN" ]; then
+  LAUNCH=("$RELEASE_BIN")
+  MATCH="^$RELEASE_BIN$"
+elif [ -x "$ROOT/src-tauri/target/debug/sufi-email" ]; then
+  # Debug build loads the frontend from the vite dev server, so start the
+  # whole tauri dev stack detached.
+  LAUNCH=(npm run tauri dev)
+  MATCH="target/debug/sufi-email$"
+else
+  echo "error: no built binary found — run 'bin/build --no-bundle' (release)" >&2
+  echo "       or 'npm run tauri dev' (development) first" >&2
+  exit 1
+fi
+
+# Don't stack a second instance on top of a running one.
+if pgrep -f "$MATCH" >/dev/null 2>&1; then
+  echo "Sufi Email is already running (pid $(pgrep -f "$MATCH" | head -1))."
+  echo "Use the tray icon (right-click -> Show Email) to open it."
+  exit 0
+fi
+
+# setsid puts the app in its own session so the terminal's SIGHUP can't
+# reach it (nohup is belt-and-braces); stdin from /dev/null so nothing
+# blocks on the terminal. Output goes to $LOG.
+(cd "$ROOT" && setsid nohup "${LAUNCH[@]}" >"$LOG" 2>&1 < /dev/null &)
+
+sleep 1
+if pgrep -f "$MATCH" >/dev/null 2>&1; then
+  echo "Sufi Email started (pid $(pgrep -f "$MATCH" | head -1)). Log: $LOG"
+  echo "It survives closing this terminal; quit from the tray menu (right-click -> Quit)."
+else
+  echo "error: Sufi Email failed to start — see $LOG" >&2
+  exit 1
+fi
