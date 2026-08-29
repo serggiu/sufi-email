@@ -487,6 +487,23 @@ dialog textarea { resize: vertical; }
 #compose-send { background: var(--accent); border-color: var(--accent); color: #10131c; }
 #compose-error { color: #f7768e; font-size: 13px; margin-top: 8px; }
 
+/* Attachments in the compose dialog. */
+#compose-attachments { margin-top: 8px; }
+#compose-attachments .att-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+#compose-attachments .att-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#compose-attachments .att-remove { flex-shrink: 0; }
+
 /* ---- confirm dialog ---- */
 #confirm-dialog { width: 420px; }
 #confirm-message { color: var(--text-dim); font-size: 13px; line-height: 1.5; }
@@ -496,6 +513,47 @@ dialog textarea { resize: vertical; }
   color: #10131c;
 }
 #confirm-ok.danger:hover { filter: brightness(1.1); }
+
+/* ---- message threads (discussion view) ---- */
+#preview-thread, #modal-thread { display: flex; flex-direction: column; }
+#modal-thread { flex: 1; overflow-y: auto; }
+.thread-msg { border-bottom: 1px solid var(--border); padding: 10px 0; }
+.thread-msg:last-child { border-bottom: none; }
+.thread-msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.thread-msg-from { font-weight: 600; }
+.thread-msg-date { color: var(--text-dim); font-size: 12px; margin-left: auto; }
+.thread-msg-frame {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  min-height: 120px;
+}
+.thread-msg .att-item { font-size: 12.5px; padding: 3px 0; }
+
+/* Inline image attachment previews. */
+.att-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0 2px;
+}
+.att-thumb {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #fff;
+  cursor: pointer;
+}
+.att-thumb:hover { border-color: var(--accent); }
 
 /* ---- full-width message modal ---- */
 #message-modal {

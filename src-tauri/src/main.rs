@@ -534,6 +534,14 @@ struct SendArgs {
     to: Vec<String>,
     subject: String,
     body: String,
+    #[serde(default)]
+    attachments: Vec<String>,
+    /// Message-ID being replied to (sets In-Reply-To, keeps threads linked).
+    #[serde(default)]
+    in_reply_to: Option<String>,
+    /// The thread's References chain (space-joined message-ids).
+    #[serde(default)]
+    references: Option<String>,
 }
 
 #[tauri::command]
@@ -543,7 +551,59 @@ async fn send_email(args: SendArgs, state: State<'_, AppState>) -> Result<(), St
         c.accounts.iter().find(|a| a.name == args.account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{}'", args.account))?;
-    mail::send_email(&acc, args.to, &args.subject, &args.body).await
+    mail::send_email(
+        &acc,
+        args.to,
+        &args.subject,
+        &args.body,
+        args.attachments,
+        args.in_reply_to,
+        args.references,
+    )
+    .await
+}
+
+/// All cached messages of one conversation, newest first.
+#[tauri::command]
+async fn get_thread(
+    account: String,
+    folder: String,
+    thread_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<mail::MessageSummary>, String> {
+    let cfg = {
+        let c = state.config.lock().unwrap();
+        c.accounts.iter().find(|a| a.name == account).cloned()
+    };
+    let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
+    let store = store::Store::open(&acc)?;
+    store.load_thread(&folder, &thread_id)
+}
+
+/// Fetch one attachment part and return it base64-encoded, for inline image
+/// thumbnails in the message view.
+#[tauri::command]
+async fn get_attachment_data(
+    account: String,
+    folder: String,
+    uid: u32,
+    part_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cfg = {
+        let c = state.config.lock().unwrap();
+        c.accounts.iter().find(|a| a.name == account).cloned()
+    };
+    let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
+    let part_index: usize = part_id.parse().map_err(|_| "invalid part id")?;
+    let acc2 = acc.clone();
+    let folder2 = folder.clone();
+    let data = tauri::async_runtime::spawn_blocking(move || {
+        mail::fetch_attachment_part(&acc2, &folder2, uid, part_index)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))??;
+    Ok(crypto::base64_encode(&data))
 }
 
 /// Fetch one attachment part by its position in the attachments iterator
@@ -567,33 +627,10 @@ async fn save_attachment(
     let part_index: usize = part_id.parse().map_err(|_| "invalid part id")?;
 
     // Fetch + extract the requested part off the UI thread.
+    let acc2 = acc.clone();
+    let folder2 = folder.clone();
     let data = tauri::async_runtime::spawn_blocking(move || {
-        let mut session = mail::imap_session_pub(&acc)?;
-        session
-            .select(&folder)
-            .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
-        let fetches = session
-            .uid_fetch(format!("{uid}"), "(BODY.PEEK[])")
-            .map_err(|e| format!("FETCH failed: {e}"))?;
-        let raw = fetches
-            .iter()
-            .next()
-            .and_then(|f| f.body())
-            .ok_or_else(|| format!("message uid {uid} not found"))?
-            .to_vec();
-        let msg = mail_parser::MessageParser::default()
-            .parse(&raw)
-            .ok_or("unparseable message")?;
-        let parts: Vec<_> = msg.attachments().collect();
-        let part = parts
-            .get(part_index)
-            .ok_or_else(|| format!("attachment {part_index} not found"))?;
-        Ok::<Vec<u8>, String>(match &part.body {
-            mail_parser::PartType::Binary(b) | mail_parser::PartType::InlineBinary(b) => b.to_vec(),
-            mail_parser::PartType::Text(t) | mail_parser::PartType::Html(t) => t.as_bytes().to_vec(),
-            mail_parser::PartType::Message(m) => m.raw_message().to_vec(),
-            mail_parser::PartType::Multipart(_) => Vec::new(),
-        })
+        mail::fetch_attachment_part(&acc2, &folder2, uid, part_index)
     })
     .await
     .map_err(|e| format!("join error: {e}"))??;
@@ -954,6 +991,8 @@ fn main() {
             move_message,
             delete_message_local,
             delete_message_server,
+            get_thread,
+            get_attachment_data,
             send_email
         ])
         .run(tauri::generate_context!())
@@ -996,8 +1035,48 @@ mod manual_send_tests {
             vec![to.clone()],
             "sufi-email send test",
             "hello from the manual send test",
+            Vec::new(),
+            None,
+            None,
         ))
         .expect("send failed");
         println!("sent to {to}");
+    }
+}
+
+#[cfg(test)]
+mod manual_inbox_tests {
+    use tauri::async_runtime::block_on;
+
+    /// List the newest INBOX messages on the server with subject + flags.
+    #[test]
+    #[ignore]
+    fn manual_inbox() {
+        let cfg = crate::account::Config::load_or_default();
+        let acc = cfg.accounts.first().expect("no account");
+        block_on(async {
+            let acc = acc.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut s = crate::mail::imap_session_pub(&acc).map_err(|e| e.to_string())?;
+                let m = s.select("INBOX").map_err(|e| e.to_string())?;
+                let top = m.exists.max(1);
+                let from = top.saturating_sub(10);
+                let f = s
+                    .fetch(&format!("{from}:{top}"), "(UID ENVELOPE)")
+                    .map_err(|e| e.to_string())?;
+                for x in f.iter() {
+                    let uid = x.uid.unwrap_or(0);
+                    let subj = x
+                        .envelope()
+                        .and_then(|e| e.subject.as_ref())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .unwrap_or_default();
+                    println!("uid {uid}: {subj}");
+                }
+                Ok::<(), String>(())
+            })
+            .await
+        })
+        .expect("failed");
     }
 }

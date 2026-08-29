@@ -22,6 +22,10 @@ fn summary(uid: u32, subject: &str, from: &str, days_ago: i64, seen: bool) -> cr
         seen,
         has_attachment: false,
         snippet: format!("snippet of {subject}"),
+        message_id: format!("mid-{uid}@test"),
+        references: String::new(),
+        in_reply_to: String::new(),
+        thread_id: format!("thread-{uid}"),
     }
 }
 
@@ -550,6 +554,7 @@ fn store_bodies_caches_and_loads_bodies() {
                 uid: 1,
                 text: Some("plain".into()),
                 html: Some("<p>html</p>".into()),
+                attachments: vec![],
             }],
         )
         .unwrap();
@@ -566,7 +571,7 @@ fn store_bodies_keeps_previous_body_when_updated() {
         .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
         .unwrap();
     store
-        .store_bodies("INBOX", &[crate::mail::BatchBody { uid: 1, text: Some("v1".into()), html: None }])
+        .store_bodies("INBOX", &[crate::mail::BatchBody { uid: 1, text: Some("v1".into()), html: None, attachments: vec![] }])
         .unwrap();
     // A summary refresh must not wipe the cached body.
     store
@@ -614,4 +619,89 @@ fn pending_delete_cleared_when_server_confirms() {
     let server: std::collections::HashSet<u32> = [8].into_iter().collect();
     store.clear_pending_deletes_not_in("INBOX", &server).unwrap();
     assert!(store.pending_delete_uids("INBOX").unwrap().contains(&8));
+}
+
+#[test]
+fn load_thread_groups_messages_by_thread_id() {
+    let (_dir, mut store) = test_store("threads");
+    // Three messages: two in one thread, one standalone.
+    let mut m1 = summary(1, "Re: hello", "a@b.com", 1, false);
+    m1.thread_id = "root@x".into();
+    let mut m2 = summary(2, "hello", "c@d.com", 2, false);
+    m2.thread_id = "root@x".into();
+    let mut m3 = summary(3, "other", "e@f.com", 1, false);
+    m3.thread_id = "other@y".into();
+    store.upsert_summaries("INBOX", &[m1, m2, m3]).unwrap();
+
+    // Reconciliation re-roots the thread to its oldest member id.
+    let all = store.load_summaries("INBOX").unwrap();
+    let t1 = all.iter().find(|m| m.uid == 1).unwrap().thread_id.clone();
+    let t2 = all.iter().find(|m| m.uid == 2).unwrap().thread_id.clone();
+    assert_eq!(t1, t2, "messages linked by a shared thread root resolve together");
+
+    let thread = store.load_thread("INBOX", &t1).unwrap();
+    assert_eq!(thread.len(), 2);
+
+    let other = store.load_thread("INBOX", &t2).unwrap();
+    assert_eq!(other.len(), 2);
+
+    let solo = all.iter().find(|m| m.uid == 3).unwrap().thread_id.clone();
+    assert_ne!(solo, t1, "standalone message stays in its own thread");
+    assert_eq!(store.load_thread("INBOX", &solo).unwrap().len(), 1);
+}
+
+#[test]
+fn reconciliation_links_messages_via_in_reply_to() {
+    let (_dir, mut store) = test_store("resolve");
+    // Original with its own id; a reply without References but with
+    // In-Reply-To pointing at the original; a second reply referencing both.
+    let mut orig = summary(1, "hello", "a@b.com", 5, false);
+    orig.message_id = "root@x".into();
+    orig.thread_id = "root@x".into();
+    let mut r1 = summary(2, "Re: hello", "c@d.com", 2, false);
+    r1.message_id = "r1@x".into();
+    r1.in_reply_to = "<root@x>".into();
+    r1.thread_id = "r1@x".into(); // pre-fix reply: no references, own id
+    let mut r2 = summary(3, "Re: hello", "a@b.com", 1, false);
+    r2.message_id = "r2@x".into();
+    r2.references = "<root@x> <r1@x>".into();
+    r2.thread_id = "root@x".into();
+    store.upsert_summaries("INBOX", &[orig, r1, r2]).unwrap();
+
+    let all = store.load_summaries("INBOX").unwrap();
+    assert_eq!(all.len(), 3);
+    // r1 (own-id thread) is pulled into the root thread via In-Reply-To.
+    let ids: std::collections::HashSet<String> =
+        all.iter().map(|m| m.thread_id.clone()).collect();
+    assert_eq!(ids.len(), 1, "all three messages resolve to one thread");
+    assert_eq!(all.iter().find(|m| m.uid == 1).unwrap().thread_id, "root@x");
+    assert_eq!(store.load_thread("INBOX", "root@x").unwrap().len(), 3);
+}
+
+#[test]
+fn store_bodies_caches_attachment_metadata() {
+    let (_dir, mut store) = test_store("bodies-attachments");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "With pics", "a@b.com", 1, false)])
+        .unwrap();
+    store
+        .store_bodies(
+            "INBOX",
+            &[crate::mail::BatchBody {
+                uid: 1,
+                text: Some("hi".into()),
+                html: None,
+                attachments: vec![crate::store::AttachmentMeta {
+                    filename: "photo.png".into(),
+                    content_type: "image/png".into(),
+                    size: 42,
+                    part_id: "0".into(),
+                }],
+            }],
+        )
+        .unwrap();
+    let atts = store.load_attachments("INBOX", 1).unwrap();
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0].filename, "photo.png");
+    assert_eq!(atts[0].content_type, "image/png");
 }

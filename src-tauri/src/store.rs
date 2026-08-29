@@ -78,6 +78,9 @@ impl Store {
                  folder     TEXT    NOT NULL,
                  uid        INTEGER NOT NULL,
                  message_id TEXT    NOT NULL DEFAULT '',
+                 refs TEXT NOT NULL DEFAULT '',
+                 in_reply_to TEXT NOT NULL DEFAULT '',
+                 thread_id  TEXT    NOT NULL DEFAULT '',
                  content_hash TEXT NOT NULL DEFAULT '',
                  subject    TEXT,
                  from_name  TEXT,
@@ -152,6 +155,19 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
         );
+        // Threading columns (added after the initial schema).
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN refs TEXT NOT NULL DEFAULT '';",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';",
+        );
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';",
+        );
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_folder_thread ON messages(folder, thread_id);",
+        );
         Ok(Store { conn })
     }
 
@@ -193,8 +209,9 @@ impl Store {
                 // Moved message: re-point the existing row to the new uid.
                 tx.execute(
                     "UPDATE messages SET uid = ?1, seen = ?2, has_attachment = ?3,
-                        subject = ?4, from_name = ?5, from_email = ?6, date = ?7, snippet = ?8
-                     WHERE folder = ?9 AND uid = ?10",
+                        subject = ?4, from_name = ?5, from_email = ?6, date = ?7, snippet = ?8,
+                        message_id = ?9, refs = ?10, in_reply_to = ?11, thread_id = ?12
+                     WHERE folder = ?13 AND uid = ?14",
                     rusqlite::params![
                         m.uid,
                         seen as i64,
@@ -204,6 +221,10 @@ impl Store {
                         from_email(&m.from),
                         date,
                         m.snippet,
+                        m.message_id,
+                        m.references,
+                        m.in_reply_to,
+                        m.thread_id,
                         folder,
                         old_uid,
                     ],
@@ -215,8 +236,9 @@ impl Store {
             let n = tx
                 .execute(
                     "INSERT INTO messages (folder, uid, content_hash, subject, from_name,
-                                           from_email, date, seen, has_attachment, snippet)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                           from_email, date, seen, has_attachment, snippet,
+                                           message_id, refs, in_reply_to, thread_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                      ON CONFLICT(folder, uid) DO UPDATE SET
                         seen        = excluded.seen,
                         has_attachment = excluded.has_attachment,
@@ -225,7 +247,10 @@ impl Store {
                         from_email  = excluded.from_email,
                         date        = excluded.date,
                         snippet     = excluded.snippet,
-                        content_hash = excluded.content_hash",
+                        content_hash = excluded.content_hash,
+                        message_id  = excluded.message_id,
+                        refs        = excluded.refs,
+                        thread_id   = excluded.thread_id",
                     rusqlite::params![
                         folder,
                         m.uid,
@@ -237,6 +262,10 @@ impl Store {
                         seen as i64,
                         m.has_attachment as i64,
                         m.snippet,
+                        m.message_id,
+                        m.references,
+                        m.in_reply_to,
+                        m.thread_id,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -293,7 +322,8 @@ impl Store {
             .conn
             .prepare(
                 "SELECT uid, COALESCE(subject,''), COALESCE(from_name,''), COALESCE(from_email,''),
-                        date, seen, has_attachment, COALESCE(snippet,'')
+                        date, seen, has_attachment, COALESCE(snippet,''),
+                        COALESCE(message_id,''), COALESCE(refs,''), COALESCE(in_reply_to,''), COALESCE(thread_id,'')
                  FROM messages WHERE folder = ?1 ORDER BY date DESC",
             )
             .map_err(|e| e.to_string())?;
@@ -308,10 +338,29 @@ impl Store {
                     seen: r.get::<_, i64>(5)? != 0,
                     has_attachment: r.get::<_, i64>(6)? != 0,
                     snippet: r.get(7)?,
+                    message_id: r.get(8)?,
+                    references: r.get(9)?,
+                    in_reply_to: r.get(10)?,
+                    thread_id: r.get(11)?,
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        let mut out = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        resolve_thread_ids(&mut out);
+        Ok(out)
+    }
+
+    /// All cached summaries of one conversation (thread), newest first.
+    pub fn load_thread(
+        &self,
+        folder: &str,
+        thread_id: &str,
+    ) -> Result<Vec<crate::mail::MessageSummary>, String> {
+        let all = self.load_summaries(folder)?;
+        Ok(all
+            .into_iter()
+            .filter(|m| m.thread_id == thread_id)
+            .collect())
     }
 
     /// Cached bodies for one message; None when we haven't cached it yet.
@@ -330,6 +379,30 @@ impl Store {
             for b in bodies {
                 stmt.execute(rusqlite::params![b.text, b.html, folder, b.uid as i64])
                     .map_err(|e| e.to_string())?;
+            }
+        }
+        // Cache attachment metadata alongside the bodies, so a body served
+        // from cache (e.g. warmed by the background watcher) still shows its
+        // attachments instead of requiring a re-fetch.
+        for b in bodies {
+            let row: Option<i64> = tx
+                .query_row(
+                    "SELECT rowid_pk FROM messages WHERE folder = ?1 AND uid = ?2",
+                    rusqlite::params![folder, b.uid as i64],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(row) = row {
+                tx.execute("DELETE FROM attachments WHERE msg_row = ?1", [row])
+                    .map_err(|e| e.to_string())?;
+                for a in &b.attachments {
+                    tx.execute(
+                        "INSERT INTO attachments (msg_row, part_id, filename, mime, size)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![row, a.part_id, a.filename, a.content_type, a.size],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())
@@ -713,6 +786,90 @@ impl Store {
     }
 }
 
+/// Resolve conversation ids transitively (union-find over message-ids).
+///
+/// A message's thread_id alone comes from its own References/In-Reply-To
+/// headers, which can be partial or missing (e.g. replies sent before the
+/// client stamped thread headers). Two messages that share any ancestor in
+/// their chains belong to one conversation, so union each message with every
+/// id it mentions; the resolved thread of a component is the oldest message
+/// in it.
+fn resolve_thread_ids(messages: &mut [crate::mail::MessageSummary]) {
+    if messages.is_empty() {
+        return;
+    }
+    let mut parent: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    fn find(parent: &mut std::collections::HashMap<String, String>, x: String) -> String {
+        match parent.get(&x) {
+            Some(p) if *p != x => {
+                let r = find(parent, p.clone());
+                parent.insert(x.clone(), r.clone());
+                r
+            }
+            Some(_) => x,
+            None => {
+                parent.insert(x.clone(), x.clone());
+                x
+            }
+        }
+    }
+    fn union(parent: &mut std::collections::HashMap<String, String>, a: String, b: String) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+
+    for m in messages.iter() {
+        let own = if m.message_id.is_empty() {
+            m.thread_id.clone()
+        } else {
+            m.message_id.clone()
+        };
+        // The pre-computed thread root plus every referenced / parent id.
+        union(&mut parent, own.clone(), m.thread_id.clone());
+        for id in crate::mail::extract_message_ids(&m.references) {
+            union(&mut parent, own.clone(), id);
+        }
+        for id in crate::mail::extract_message_ids(&m.in_reply_to) {
+            union(&mut parent, own.clone(), id);
+        }
+    }
+
+    // Component root = the id of the oldest message in it.
+    let mut root_oldest: std::collections::HashMap<String, (i64, String)> = std::collections::HashMap::new();
+    for m in messages.iter() {
+        let own = if m.message_id.is_empty() {
+            m.thread_id.clone()
+        } else {
+            m.message_id.clone()
+        };
+        let root = find(&mut parent, own.clone());
+        let ts = m.date.map(|d| d.timestamp()).unwrap_or(i64::MAX);
+        match root_oldest.get(&root) {
+            Some((old_ts, _)) if old_ts <= &ts => {}
+            _ => {
+                root_oldest.insert(root, (ts, own));
+            }
+        }
+    }
+
+    for m in messages.iter_mut() {
+        let own = if m.message_id.is_empty() {
+            m.thread_id.clone()
+        } else {
+            m.message_id.clone()
+        };
+        let root = find(&mut parent, own);
+        if let Some((_, oldest_id)) = root_oldest.get(&root) {
+            m.thread_id = oldest_id.clone();
+        }
+    }
+}
+
+
 fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' { c } else { '_' })
@@ -843,30 +1000,37 @@ fn combine_from(name: String, email: String) -> String {
 
 /// Extract attachment metadata while parsing a raw message.
 pub fn extract_attachments(raw: &[u8]) -> Vec<AttachmentMeta> {
+    match MessageParser::default().parse(raw) {
+        Some(msg) => extract_attachments_from(&msg),
+        None => Vec::new(),
+    }
+}
+
+/// Attachment metadata from an already-parsed message (used by the message
+/// stream, which parses the raw message for snippets anyway).
+pub(crate) fn extract_attachments_from(msg: &mail_parser::Message) -> Vec<AttachmentMeta> {
     let mut out = Vec::new();
-    if let Some(msg) = MessageParser::default().parse(raw) {
-        for (i, part) in msg.attachments().enumerate() {
-            let mime = part
-                .content_type()
-                .map(|c| {
-                    match &c.c_subtype {
-                        Some(sub) => format!("{}/{}", c.ctype(), sub),
-                        None => c.ctype().to_string(),
-                    }
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            out.push(AttachmentMeta {
-                filename: part
-                    .attachment_name()
-                    .unwrap_or("attachment")
-                    .to_string(),
-                content_type: mime,
-                size: part.len() as i64,
-                // Position in the attachments iterator; used to locate the
-                // part again when the user asks to save it.
-                part_id: i.to_string(),
-            });
-        }
+    for (i, part) in msg.attachments().enumerate() {
+        let mime = part
+            .content_type()
+            .map(|c| {
+                match &c.c_subtype {
+                    Some(sub) => format!("{}/{}", c.ctype(), sub),
+                    None => c.ctype().to_string(),
+                }
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        out.push(AttachmentMeta {
+            filename: part
+                .attachment_name()
+                .unwrap_or("attachment")
+                .to_string(),
+            content_type: mime,
+            size: part.len() as i64,
+            // Position in the attachments iterator; used to locate the
+            // part again when the user asks to save it.
+            part_id: i.to_string(),
+        });
     }
     out
 }

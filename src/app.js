@@ -298,61 +298,103 @@ async function loadMessages() {
   }
 }
 
+function stripSubjectPrefixes(subject) {
+  let s = String(subject || "");
+  for (let i = 0; i < 5; i++) {
+    const m = /^\s*(re|fwd|fw|aw|sv)\s*:\s*/i.exec(s);
+    if (!m) break;
+    s = s.slice(m[0].length);
+  }
+  return s.trim();
+}
+
+// Group messages into conversations by thread_id, each thread sorted newest
+// first; threads sorted by their newest message.
+function groupThreads(messages) {
+  const map = new Map();
+  for (const m of messages) {
+    const tid = m.thread_id || "unt:" + m.uid;
+    if (!map.has(tid)) map.set(tid, []);
+    map.get(tid).push(m);
+  }
+  const threads = [...map.values()];
+  for (const t of threads) t.sort((a, b) => (b.date || 0) - (a.date || 0));
+  threads.sort((a, b) => (b[0].date || 0) - (a[0].date || 0));
+  return threads;
+}
+
 function renderMessages() {
   const ul = $("message-list");
   ul.innerHTML = "";
-  for (const m of state.messages) {
+  for (const thread of groupThreads(state.messages)) {
+    const newest = thread[0];
+    const unread = thread.filter((m) => !m.seen).length;
     const li = document.createElement("li");
-    if (m.seen) li.classList.add("read");
-    else li.classList.add("unread");
-    if (m.uid === state.selectedUid) li.classList.add("selected");
-    li.dataset.uid = String(m.uid);
+    if (unread > 0) li.classList.add("unread");
+    else li.classList.add("read");
+    if (newest.uid === state.selectedUid) li.classList.add("selected");
+    li.dataset.threadId = newest.thread_id || "";
 
     const top = document.createElement("div");
     top.className = "msg-top";
     const from = document.createElement("span");
     from.className = "msg-from";
-    from.textContent = m.from || "(unknown)";
+    from.textContent = newest.from || "(unknown)";
     const date = document.createElement("span");
     date.className = "msg-date";
-    date.textContent = fmtDate(m.date);
+    date.textContent = fmtDate(newest.date);
     top.append(from, date);
 
     const subj = document.createElement("div");
     subj.className = "msg-subject";
-    subj.textContent = (m.has_attachment ? "📎 " : "") + m.subject;
+    const subject = stripSubjectPrefixes(newest.subject);
+    subj.textContent =
+      (newest.has_attachment ? "📎 " : "") +
+      (subject || "(no subject)") +
+      (thread.length > 1 ? ` (${thread.length})` : "");
+    if (unread > 0) {
+      const badge = document.createElement("span");
+      badge.className = "unread-badge";
+      badge.textContent = unread > 99 ? "99+" : String(unread);
+      subj.appendChild(badge);
+    }
 
     li.append(top, subj);
-    if (m.snippet) {
+    if (newest.snippet) {
       const snippet = document.createElement("div");
       snippet.className = "msg-snippet";
-      snippet.textContent = m.snippet;
+      snippet.textContent = newest.snippet;
       li.appendChild(snippet);
     }
 
-    li.addEventListener("click", () => selectMessage(m.uid, li));
-    // Double-click: full-width message details modal.
-    li.addEventListener("dblclick", () => openMessageModal(m.uid));
+    li.addEventListener("click", () => selectThread(thread, li));
+    li.addEventListener("dblclick", () => openThreadModal(thread));
     li.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      showContextMenu(e.clientX, e.clientY, m.uid);
+      showContextMenu(e.clientX, e.clientY, newest.uid);
     });
     ul.appendChild(li);
   }
 }
 
-// Reopen the last-read message of the current folder after a (re)load: the
-// remembered UID for this account+folder, if it is still in the list. Runs
-// on every completed load but no-ops once the message is already selected,
-// so auto-refresh cycles don't re-fetch its body.
+// Reopen the last-read thread of the current folder after a (re)load: the
+// remembered message UID identifies a thread, which is re-opened. No-ops
+// once that thread is already selected, so auto-refresh cycles don't
+// re-fetch.
 function restoreSelection() {
   const savedUid = loadFolderSelection(localStorage, state.account.name, state.folder);
   if (savedUid == null || state.selectedUid === savedUid) return;
   const msg = state.messages.find((m) => m.uid === savedUid);
   if (!msg) return;
-  const li = document.querySelector(`#message-list li[data-uid="${savedUid}"]`);
-  if (!li) return;
-  selectMessage(savedUid, li);
+  const thread = groupThreads(state.messages).find((t) =>
+    t.some((m) => m.uid === savedUid)
+  );
+  if (!thread) return;
+  const tid = thread[0].thread_id || "";
+  const li = document.querySelector(
+    `#message-list li[data-thread-id="${CSS.escape(tid)}"]`
+  );
+  selectThread(thread, li);
 }
 
 /* ---------- mark as read / unread ---------- */
@@ -397,34 +439,30 @@ async function setSeen(uid, seen) {
   }
 }
 
-async function selectMessage(uid, li) {
-  state.selectedUid = uid;
-  saveSelection(localStorage, state.account.name, state.folder, uid);
+// Open a conversation in the details column: renders the full discussion
+// (newest first) and marks every unread message in it as read.
+async function selectThread(thread, li) {
+  if (!thread || !thread.length) return;
+  const newest = thread[0];
+  state.selectedUid = newest.uid;
+  saveSelection(localStorage, state.account.name, state.folder, newest.uid);
   document
     .querySelectorAll("#message-list li")
     .forEach((el) => el.classList.remove("selected"));
-  li.classList.add("selected");
+  if (li) li.classList.add("selected");
 
-  // Keep selected for >=0.7s to mark as read. While offline the backend
-  // applies the change locally and queues it for the server.
-  clearTimeout(markReadTimer);
-  const msg = state.messages.find((m) => m.uid === uid);
-  if (msg && !msg.seen) {
-    markReadTimer = setTimeout(() => setSeen(uid, true), 700);
-  }
+  $("preview-empty").classList.add("hidden");
+  $("preview-content").classList.remove("hidden");
+  await renderThread(
+    $("preview-subject"),
+    $("preview-meta"),
+    $("preview-thread"),
+    thread
+  );
 
-  try {
-    const body = await invoke("fetch_message", {
-      account: state.account.name,
-      folder: state.folder,
-      uid,
-    });
-    // The user may have clicked another message while this body was
-    // in flight (e.g. a background restore racing a manual click).
-    if (state.selectedUid !== uid) return;
-    renderPreview(body);
-  } catch (e) {
-    showError(String(e));
+  // Opening a thread is an explicit read for all of it.
+  for (const m of thread) {
+    if (!m.seen) setSeen(m.uid, true);
   }
 }
 
@@ -635,29 +673,18 @@ async function moveMessage(uid, destFolder) {
 
 /* ---------- preview ---------- */
 
-// The message-details view is shared between the three-column preview and
-// the full-width message modal: both render subject / meta / body / attachments
-// through the same functions, so a future change to the message view updates
-// both places. A "view" is just the set of elements to render into.
-const columnView = {
-  empty: $("preview-empty"),
-  content: $("preview-content"),
-  subject: $("preview-subject"),
-  meta: $("preview-meta"),
-  frame: $("preview-frame"),
-  attachments: $("attachment-list"),
-};
-const modalView = {
-  subject: $("modal-subject"),
-  meta: $("modal-meta"),
-  frame: $("modal-frame"),
-  attachments: $("modal-attachment-list"),
-};
+/* ---------- preview (thread / discussion view) ---------- */
 
-async function renderViewAttachments(view, uid) {
-  const box = view.attachments;
-  box.innerHTML = "";
-  box.classList.add("hidden");
+// Renders a conversation (newest message first) into the given elements:
+// subject + meta as the thread header, then one block per message (sender,
+// date, sandboxed body, attachments). Used by both the three-column preview
+// and the full-width modal, so a future change to the message view updates
+// both places. Each message body goes through the shared renderViewBody
+// (same CSP + link handling as before).
+
+// Attachments for one message inside a thread block. Image attachments get
+// small inline previews at the top, then the full list with save buttons.
+async function renderBlockAttachments(box, uid) {
   let atts = [];
   try {
     atts = await invoke("list_attachments", {
@@ -669,6 +696,37 @@ async function renderViewAttachments(view, uid) {
     return; // attachment listing is best-effort
   }
   if (!atts.length) return;
+
+  // Inline thumbnails for image attachments (skip very large ones to keep
+  // the IPC light — they still appear in the list with Save as…).
+  const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
+  const images = atts.filter(
+    (a) => (a.contentType || "").startsWith("image/") && a.size <= MAX_PREVIEW_BYTES
+  );
+  if (images.length) {
+    const row = document.createElement("div");
+    row.className = "att-thumbs";
+    for (const a of images) {
+      try {
+        const b64 = await invoke("get_attachment_data", {
+          account: state.account.name,
+          folder: state.folder,
+          uid,
+          partId: a.part_id,
+        });
+        const img = document.createElement("img");
+        img.className = "att-thumb";
+        img.src = `data:${a.contentType};base64,${b64}`;
+        img.title = a.filename;
+        img.alt = a.filename;
+        img.addEventListener("click", () => saveAttachment(uid, a));
+        row.appendChild(img);
+      } catch (_) {
+        // Individual preview failure is fine; the list entry remains.
+      }
+    }
+    if (row.childElementCount) box.appendChild(row);
+  }
 
   const header = document.createElement("div");
   header.className = "att-header";
@@ -691,7 +749,55 @@ async function renderViewAttachments(view, uid) {
     item.append(name, size, btn);
     box.appendChild(item);
   }
-  box.classList.remove("hidden");
+}
+
+async function renderThread(subjectEl, metaEl, container, thread) {
+  container.innerHTML = "";
+  const newest = thread[0];
+  subjectEl.textContent = stripSubjectPrefixes(newest.subject) || "(no subject)";
+  const people = new Set(
+    thread.map((m) => (m.from || "").split(" <")[0].trim()).filter(Boolean)
+  );
+  metaEl.textContent =
+    `${thread.length} message${thread.length > 1 ? "s" : ""}` +
+    (people.size > 1 ? ` · ${people.size} people` : "");
+
+  for (const m of thread) {
+    const block = document.createElement("div");
+    block.className = "thread-msg";
+    block.dataset.uid = String(m.uid);
+
+    const head = document.createElement("div");
+    head.className = "thread-msg-head";
+    const from = document.createElement("span");
+    from.className = "thread-msg-from";
+    from.textContent = m.from || "(unknown)";
+    const date = document.createElement("span");
+    date.className = "thread-msg-date";
+    date.textContent = m.date ? new Date(m.date).toLocaleString() : "";
+    head.append(from, date);
+
+    const frame = document.createElement("iframe");
+    frame.className = "thread-msg-frame";
+    frame.sandbox = "allow-scripts";
+    const atts = document.createElement("div");
+    atts.className = "thread-msg-atts";
+
+    block.append(head, frame, atts);
+    container.appendChild(block);
+
+    try {
+      const body = await invoke("fetch_message", {
+        account: state.account.name,
+        folder: state.folder,
+        uid: m.uid,
+      });
+      await renderViewBody({ frame }, body);
+    } catch (_) {
+      // Offline or not cached: leave the block header, empty body.
+    }
+    await renderBlockAttachments(atts, m.uid);
+  }
 }
 
 function renderPreviewEmpty() {
@@ -699,36 +805,26 @@ function renderPreviewEmpty() {
   $("preview-content").classList.add("hidden");
 }
 
-async function renderPreview(body) {
-  const summary = state.messages.find((m) => m.uid === body.uid) || {};
-  $("preview-empty").classList.add("hidden");
-  $("preview-content").classList.remove("hidden");
-  renderViewSubject(columnView, summary);
-  renderViewMeta(columnView, summary);
-  await renderViewBody(columnView, body);
-  renderViewAttachments(columnView, body.uid);
-}
-
-// Full-width message details modal (opened by double-clicking a row). Uses
-// the same view functions as the three-column preview.
+// Full-width message modal: the whole conversation (opened by
+// double-clicking a thread row).
 let modalUid = null;
+let modalThreadId = null;
 
-async function openMessageModal(uid) {
-  modalUid = uid;
-  const summary = state.messages.find((m) => m.uid === uid) || {};
+async function openThreadModal(thread) {
+  if (!thread || !thread.length) return;
+  modalThreadId = thread[0].thread_id || "";
+  modalUid = thread[0].uid;
   try {
-    const body = await invoke("fetch_message", {
-      account: state.account.name,
-      folder: state.folder,
-      uid,
-    });
-    renderViewSubject(modalView, summary);
-    renderViewMeta(modalView, summary);
-    await renderViewBody(modalView, body);
-    renderViewAttachments(modalView, uid);
+    await renderThread(
+      $("modal-subject"),
+      $("modal-meta"),
+      $("modal-thread"),
+      thread
+    );
     $("message-modal").showModal();
-    // Double-clicking is an explicit read: mark immediately.
-    if (summary.seen === false) setSeen(uid, true);
+    for (const m of thread) {
+      if (!m.seen) setSeen(m.uid, true);
+    }
   } catch (e) {
     showError(String(e));
   }
@@ -759,16 +855,66 @@ async function saveAttachment(uid, att) {
 
 /* ---------- compose ---------- */
 
+let composeAttachments = [];
+let composeReplyContext = null; // { inReplyTo, references } when replying
+
+// Attach files from disk to the current compose. Uses the native file
+// picker; the paths are sent to the backend which reads them on send.
+async function attachFiles() {
+  if (!window.__TAURI__ || !window.__TAURI__.dialog) return;
+  try {
+    const picked = await window.__TAURI__.dialog.open({ multiple: true });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    for (const p of paths) {
+      if (!composeAttachments.includes(p)) composeAttachments.push(p);
+    }
+    renderComposeAttachments();
+  } catch (e) {
+    showError(String(e));
+  }
+}
+
+function renderComposeAttachments() {
+  const box = $("compose-attachments");
+  box.innerHTML = "";
+  for (const path of composeAttachments) {
+    const item = document.createElement("div");
+    item.className = "att-item";
+    const name = document.createElement("span");
+    name.className = "att-name";
+    name.textContent = path.split("/").pop();
+    name.title = path;
+    const remove = document.createElement("button");
+    remove.className = "att-remove";
+    remove.textContent = "✕";
+    remove.title = "Remove attachment";
+    remove.addEventListener("click", () => {
+      composeAttachments = composeAttachments.filter((p) => p !== path);
+      renderComposeAttachments();
+    });
+    item.append(name, remove);
+    box.appendChild(item);
+  }
+}
+
 function openCompose(replyTo) {
   const dlg = $("compose-dialog");
   $("compose-error").classList.add("hidden");
+  composeAttachments = [];
+  renderComposeAttachments();
   if (replyTo) {
+    composeReplyContext = {
+      inReplyTo: replyTo.message_id || null,
+      references: replyTo.references || null,
+    };
     $("compose-to").value = replyTo.from || "";
     $("compose-subject").value = replyTo.subject.startsWith("Re:")
       ? replyTo.subject
       : "Re: " + replyTo.subject;
     $("compose-body").value = `\n\n----- Original message -----\nFrom: ${replyTo.from}\nSubject: ${replyTo.subject}\n`;
   } else {
+    composeReplyContext = null;
     $("compose-to").value = "";
     $("compose-subject").value = "";
     $("compose-body").value = "";
@@ -813,6 +959,9 @@ async function sendCompose(e) {
         to,
         subject,
         body,
+        attachments: composeAttachments,
+        inReplyTo: composeReplyContext ? composeReplyContext.inReplyTo : null,
+        references: composeReplyContext ? composeReplyContext.references : null,
       },
     });
     showSendStatus("Sent ✓");
@@ -1132,7 +1281,20 @@ function initMailRefreshListener() {
 function initExternalLinks() {
   if (!window.__TAURI__ || !window.__TAURI__.opener) return;
   window.addEventListener("message", (e) => {
-    if (!e.data || e.data.type !== "sufi-open-url") return;
+    if (!e.data) return;
+    // Auto-size an email body iframe to its content (reported by the
+    // hash-pinned script inside), so thread discussions use the full
+    // height instead of tiny fixed iframes.
+    if (e.data.type === "sufi-frame-size" && typeof e.data.height === "number") {
+      for (const f of document.querySelectorAll(".thread-msg-frame")) {
+        if (f.contentWindow === e.source) {
+          f.style.height = Math.max(80, Math.min(e.data.height, 3000)) + "px";
+          break;
+        }
+      }
+      return;
+    }
+    if (e.data.type !== "sufi-open-url") return;
     const url = e.data.url;
     if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return;
     window.__TAURI__.opener.openUrl(url).catch((err) => showError(String(err)));
@@ -1155,6 +1317,7 @@ function init() {
   initMailRefreshListener();
   initExternalLinks();
   $("compose-btn").addEventListener("click", () => openCompose(null));
+  $("compose-attach").addEventListener("click", attachFiles);
   document.getElementById("compose-form").addEventListener("submit", sendCompose);
   $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());
   $("reply-btn").addEventListener("click", () => {

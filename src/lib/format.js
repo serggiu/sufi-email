@@ -36,7 +36,13 @@ const LINK_HANDLER_CODE =
   '  if (!/^https?:\\/\\//i.test(href)) return;\n' +
   '  e.preventDefault();\n' +
   '  window.parent.postMessage({ type: "sufi-open-url", url: href }, "*");\n' +
-  '}, true);';
+  '}, true);\n' +
+  'function sufiReportSize() {\n' +
+  '  var h = Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0);\n' +
+  '  window.parent.postMessage({ type: "sufi-frame-size", height: h }, "*");\n' +
+  '}\n' +
+  'window.addEventListener("load", sufiReportSize);\n' +
+  'if (window.ResizeObserver) { new ResizeObserver(sufiReportSize).observe(document.body); }';
 
 let linkHandlerHash = null;
 async function linkHandlerSha256() {

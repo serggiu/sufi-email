@@ -600,3 +600,68 @@ fn fetch_envelope_preview_decodes_real_world_github_subject() {
         assert!(from.contains("notifications@example.com"));
     });
 }
+
+// ---------------------------------------------------------------------------
+// Attachment MIME guessing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn content_type_for_guesses_common_extensions() {
+    use lettre::message::header::ContentType;
+    let ct = |name: &str| crate::mail::content_type_for(name);
+    assert_eq!(ct("report.pdf"), ContentType::parse("application/pdf").unwrap());
+    assert_eq!(ct("photo.PNG"), ContentType::parse("image/png").unwrap());
+    assert_eq!(ct("notes.txt"), ContentType::parse("text/plain").unwrap());
+    assert_eq!(ct("doc.docx"), ContentType::parse("application/vnd.openxmlformats-officedocument.wordprocessingml.document").unwrap());
+    // Unknown / missing extensions fall back to octet-stream.
+    assert_eq!(ct("archive.xyz"), ContentType::parse("application/octet-stream").unwrap());
+    assert_eq!(ct("README"), ContentType::parse("application/octet-stream").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Image attachment previews
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_attachments_reports_image_content_types() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let msg = FakeMessage::new(1, "With pics", "a@b.com", 1, false)
+            .with_image_attachment("photo.png", "image/png", "iVBORw0KGgo=");
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "ImgAtt");
+
+        let atts = crate::mail::attachment_meta(&acc, "INBOX", 1)
+            .expect("attachments");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename, "photo.png");
+        assert_eq!(atts[0].content_type, "image/png");
+        assert!(atts[0].size > 0);
+    });
+}
+
+#[test]
+fn get_attachment_data_returns_decodable_base64() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let msg = FakeMessage::new(1, "With pics", "a@b.com", 1, false)
+            .with_image_attachment("photo.png", "image/png", "iVBORw0KGgo=");
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "ImgData");
+
+        let atts = crate::mail::attachment_meta(&acc, "INBOX", 1).expect("atts");
+        let part_id = &atts[0].part_id;
+        let part_index: usize = part_id.parse().unwrap();
+        let bytes = block_on(async {
+            let acc = acc.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::mail::fetch_attachment_part(&acc, "INBOX", 1, part_index)
+            })
+            .await
+        })
+        .expect("join")
+        .expect("data");
+        // "iVBORw0KGgo=" base64-decodes to the PNG magic bytes \x89PNG\r\n\x1a\n.
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+    });
+}

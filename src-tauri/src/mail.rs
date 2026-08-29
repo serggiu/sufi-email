@@ -26,6 +26,17 @@ pub struct MessageSummary {
     pub has_attachment: bool,
     /// First few hundred characters of the plain-text body.
     pub snippet: String,
+    /// The message's own Message-ID (used to thread our outgoing replies).
+    pub message_id: String,
+    /// The full References chain (space-joined message-ids), for building
+    /// outgoing thread headers.
+    pub references: String,
+    /// The immediate parent message-id (In-Reply-To), for thread resolution.
+    pub in_reply_to: String,
+    /// Conversation identifier: the thread root Message-ID (first entry of
+    /// References, else In-Reply-To, else own Message-ID, else a
+    /// normalized-subject fallback). Stable as the thread grows.
+    pub thread_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +158,59 @@ fn address_display(a: &mail_parser::Addr) -> String {
     } else {
         format!("{name} <{email}>")
     }
+}
+
+/// Extract the message-ids (angle brackets stripped) from a References /
+/// In-Reply-To style header value.
+pub(crate) fn extract_message_ids(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
+        .map(|t| t.trim().trim_start_matches('<').trim_end_matches('>'))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Normalize a subject for the no-Message-ID fallback: strip Re:/Fwd:
+/// prefixes, lowercase, collapse whitespace.
+fn normalize_subject(subject: &str) -> String {
+    let mut s = subject.trim().to_lowercase();
+    loop {
+        let before = s.clone();
+        for prefix in ["re:", "fwd:", "fw:", "aw:", "sv:"] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.trim_start().to_string();
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    collapse_whitespace(&s)
+}
+
+/// The string form of a parsed header value (Text or TextList).
+fn header_value_str(v: &mail_parser::HeaderValue) -> String {
+    match v {
+        mail_parser::HeaderValue::Text(t) => t.to_string(),
+        mail_parser::HeaderValue::TextList(list) => list.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Compute a stable conversation identifier: the thread root Message-ID
+/// (first References entry, else In-Reply-To, else the message's own id,
+/// else a normalized-subject fallback).
+fn compute_thread_id(message_id: &str, in_reply_to: &str, references: &str, subject: &str) -> String {
+    if let Some(first) = extract_message_ids(references).first() {
+        return first.clone();
+    }
+    if let Some(first) = extract_message_ids(in_reply_to).first() {
+        return first.clone();
+    }
+    if !message_id.is_empty() {
+        return message_id.to_string();
+    }
+    format!("subj:{}", normalize_subject(subject))
 }
 
 /// Verify IMAP credentials by logging in and immediately logging out.
@@ -485,6 +549,9 @@ pub struct BatchBody {
     pub uid: u32,
     pub text: Option<String>,
     pub html: Option<String>,
+    /// Attachment metadata, extracted while parsing the raw message (so the
+    /// cache warm-up stores them alongside the bodies).
+    pub attachments: Vec<crate::store::AttachmentMeta>,
 }
 
 /// Build a summary from a single fetched message, plus the message's plain
@@ -583,6 +650,22 @@ fn summarize(f: &imap::types::Fetch) -> Option<(MessageSummary, BatchBody)> {
         })
         .unwrap_or((None, None));
 
+    // Threading: own Message-ID + References chain + conversation id.
+    let message_id = parsed
+        .as_ref()
+        .and_then(|m| m.message_id())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let references = parsed
+        .as_ref()
+        .map(|m| header_value_str(m.references()))
+        .unwrap_or_default();
+    let in_reply_to = parsed
+        .as_ref()
+        .map(|m| header_value_str(m.in_reply_to()))
+        .unwrap_or_default();
+    let thread_id = compute_thread_id(&message_id, &in_reply_to, &references, &subject);
+
     Some((
         MessageSummary {
             uid: f.uid.unwrap_or(f.message),
@@ -592,8 +675,20 @@ fn summarize(f: &imap::types::Fetch) -> Option<(MessageSummary, BatchBody)> {
             seen,
             has_attachment,
             snippet,
+            message_id,
+            references,
+            in_reply_to,
+            thread_id,
         },
-        BatchBody { uid: f.uid.unwrap_or(f.message), text, html },
+        BatchBody {
+            uid: f.uid.unwrap_or(f.message),
+            text,
+            html,
+            attachments: parsed
+                .as_ref()
+                .map(crate::store::extract_attachments_from)
+                .unwrap_or_default(),
+        },
     ))
 }
 
@@ -869,13 +964,57 @@ pub async fn test_smtp(acc: &AccountConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Guess a ContentType from a filename extension (octet-stream fallback).
+pub fn content_type_for(filename: &str) -> lettre::message::header::ContentType {
+    use lettre::message::header::ContentType;
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "txt" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    ContentType::parse(mime).unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap())
+}
+
+/// Send an email, optionally with file attachments (paths read from disk).
+/// When replying, pass the replied-to message's Message-ID and References
+/// chain so the outgoing mail joins the same thread.
 pub async fn send_email(
     acc: &AccountConfig,
     to: Vec<String>,
     subject: &str,
     body: &str,
+    attachments: Vec<String>,
+    in_reply_to: Option<String>,
+    references: Option<String>,
 ) -> Result<(), String> {
-    use lettre::message::Mailbox;
+    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -887,10 +1026,55 @@ pub async fn send_email(
         let m: Mailbox = t.parse().map_err(|e| format!("bad to address '{t}': {e}"))?;
         builder = builder.to(m);
     }
-    let email = builder
-        .subject(subject.to_string())
-        .body(body.to_string())
-        .map_err(|e| format!("build message: {e}"))?;
+    // Threading headers: wrap bare message-ids in angle brackets as RFC
+    // 5322 requires (the stored ids are bracket-less).
+    if let Some(irt) = in_reply_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let id = irt.trim_start_matches('<').trim_end_matches('>');
+        builder = builder.in_reply_to(format!("<{id}>"));
+    }
+    if let Some(refs) = references.as_deref().filter(|s| !s.trim().is_empty()) {
+        let joined = refs
+            .split_whitespace()
+            .map(|id| format!("<{}>", id.trim_start_matches('<').trim_end_matches('>')))
+            .collect::<Vec<_>>()
+            .join(" ");
+        builder = builder.references(joined);
+    }
+
+    // Read attachment files (blocking IO) and build the multipart body.
+    let mut parts: Vec<SinglePart> = Vec::with_capacity(attachments.len() + 1);
+    parts.push(
+        SinglePart::builder()
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_string()),
+    );
+    for path in &attachments {
+        let bytes = std::fs::read(path).map_err(|e| format!("read attachment {path}: {e}"))?;
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let ct = content_type_for(&filename);
+        parts.push(lettre::message::Attachment::new(filename).body(bytes, ct));
+    }
+
+    let email = if attachments.is_empty() {
+        builder
+            .subject(subject.to_string())
+            .body(body.to_string())
+            .map_err(|e| format!("build message: {e}"))?
+    } else {
+        let first = parts.pop().expect("text part always present");
+        let mut mp = MultiPart::mixed().singlepart(first);
+        for part in parts {
+            mp = mp.singlepart(part);
+        }
+        builder
+            .subject(subject.to_string())
+            .multipart(mp)
+            .map_err(|e| format!("build message: {e}"))?
+    };
 
     let smtp_user = acc.smtp_username.as_deref().unwrap_or(&acc.username);
     let smtp_pass = crypto::unseal_password(acc.smtp_password.as_deref().unwrap_or(&acc.password))?;
@@ -910,4 +1094,110 @@ pub async fn send_email(
         .await
         .map_err(|e| format!("send failed: {e}"))?;
     Ok(())
+}
+
+/// Fetch one attachment part (by its position in the attachments iterator)
+/// from the server. Shared by save and thumbnail previews.
+pub(crate) fn fetch_attachment_part(
+    acc: &AccountConfig,
+    folder: &str,
+    uid: u32,
+    part_index: usize,
+) -> Result<Vec<u8>, String> {
+    let mut session = imap_session(acc)?;
+    session
+        .select(folder)
+        .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+    let fetches = session
+        .uid_fetch(format!("{uid}"), "(BODY.PEEK[])")
+        .map_err(|e| format!("FETCH failed: {e}"))?;
+    let raw = fetches
+        .iter()
+        .next()
+        .and_then(|f| f.body())
+        .ok_or_else(|| format!("message uid {uid} not found"))?
+        .to_vec();
+    let msg = MessageParser::default().parse(&raw).ok_or("unparseable message")?;
+    let parts: Vec<_> = msg.attachments().collect();
+    let part = parts
+        .get(part_index)
+        .ok_or_else(|| format!("attachment {part_index} not found"))?;
+    Ok(match &part.body {
+        mail_parser::PartType::Binary(b) | mail_parser::PartType::InlineBinary(b) => b.to_vec(),
+        mail_parser::PartType::Text(t) | mail_parser::PartType::Html(t) => t.as_bytes().to_vec(),
+        mail_parser::PartType::Message(m) => m.raw_message().to_vec(),
+        mail_parser::PartType::Multipart(_) => Vec::new(),
+    })
+}
+
+/// Attachment metadata for a message, extracted from the raw server message.
+#[cfg(test)]
+pub(crate) fn attachment_meta(
+    acc: &AccountConfig,
+    folder: &str,
+    uid: u32,
+) -> Result<Vec<store::AttachmentMeta>, String> {
+    let mut session = imap_session(acc)?;
+    session
+        .select(folder)
+        .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+    let fetches = session
+        .uid_fetch(format!("{uid}"), "(BODY.PEEK[])")
+        .map_err(|e| format!("FETCH failed: {e}"))?;
+    let raw = fetches
+        .iter()
+        .next()
+        .and_then(|f| f.body())
+        .ok_or_else(|| format!("message uid {uid} not found"))?;
+    Ok(store::extract_attachments(raw))
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    #[test]
+    fn thread_id_prefers_references_root() {
+        let tid = compute_thread_id(
+            "mid-child@x",
+            "<mid-parent@x>",
+            "<mid-root@x> <mid-parent@x>",
+            "Re: hello",
+        );
+        assert_eq!(tid, "mid-root@x");
+    }
+
+    #[test]
+    fn thread_id_falls_back_to_in_reply_to() {
+        let tid = compute_thread_id("mid-child@x", "<mid-parent@x>", "", "Re: hello");
+        assert_eq!(tid, "mid-parent@x");
+    }
+
+    #[test]
+    fn thread_id_falls_back_to_own_message_id() {
+        let tid = compute_thread_id("mid-own@x", "", "", "hello");
+        assert_eq!(tid, "mid-own@x");
+    }
+
+    #[test]
+    fn thread_id_falls_back_to_normalized_subject() {
+        let tid = compute_thread_id("", "", "", "  Re: FWD: Hello   World ");
+        assert_eq!(tid, "subj:hello world");
+    }
+
+    #[test]
+    fn extract_message_ids_strips_angle_brackets() {
+        assert_eq!(
+            extract_message_ids("<a@x> <b@y>"),
+            vec!["a@x".to_string(), "b@y".to_string()]
+        );
+        assert!(extract_message_ids("").is_empty());
+    }
+
+    #[test]
+    fn normalize_subject_strips_prefixes_recursively() {
+        assert_eq!(normalize_subject("Re: re: Fwd: hello"), "hello");
+        assert_eq!(normalize_subject("Hello"), "hello");
+        assert_eq!(normalize_subject("  Multiple   spaces "), "multiple spaces");
+    }
 }

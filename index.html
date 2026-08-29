@@ -60,8 +60,7 @@
               <button id="move-btn">→ Move</button>
               <button id="delete-btn" class="danger">✕ Delete</button>
             </div>
-            <div id="attachment-list" class="hidden"></div>
-            <iframe id="preview-frame" sandbox="allow-scripts"></iframe>
+            <div id="preview-thread"></div>
           </div>
         </section>
       </div>
@@ -131,8 +130,7 @@
           <button id="modal-move">→ Move</button>
           <button id="modal-delete" class="danger">✕ Delete</button>
         </div>
-        <div id="modal-attachment-list" class="hidden"></div>
-        <iframe id="modal-frame" sandbox="allow-scripts"></iframe>
+        <div id="modal-thread"></div>
       </dialog>
 
       <dialog id="confirm-dialog">
@@ -152,8 +150,10 @@
           <label>To <input id="compose-to" type="text" placeholder="a@b.com, c@d.com" required /></label>
           <label>Subject <input id="compose-subject" type="text" required /></label>
           <textarea id="compose-body" rows="12" placeholder="Write your message…"></textarea>
+          <div id="compose-attachments"></div>
           <div id="compose-error" class="hidden"></div>
           <div class="dialog-buttons">
+            <button type="button" id="compose-attach">📎 Attach</button>
             <button type="button" id="compose-cancel">Cancel</button>
             <button type="submit" id="compose-send">Send</button>
           </div>

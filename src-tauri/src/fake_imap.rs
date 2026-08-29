@@ -67,6 +67,20 @@ impl FakeMessage {
         self
     }
 
+    /// text part plus one image attachment with a given content type and
+    /// base64 body (for thumbnail preview tests).
+    pub fn with_image_attachment(mut self, filename: &str, content_type: &str, base64: &str) -> Self {
+        self.body = format!(
+            "--BOUND\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: 7bit\r\n\r\n{}\r\n--BOUND\r\nContent-Type: {ct}; name=\"{f}\"\r\nContent-Disposition: attachment; filename=\"{f}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b}\r\n--BOUND--\r\n",
+            self.body.replace('\n', "\r\n"),
+            f = filename,
+            ct = content_type,
+            b = base64
+        );
+        self.attachment = Some(filename.into());
+        self
+    }
+
     fn envelope(&self) -> String {
         // All 10 envelope fields; empty name must be NIL, not "".
         format!(
