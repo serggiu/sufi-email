@@ -42,6 +42,31 @@ impl TrayIcon {
             indicator.set_label(title.as_str(), "");
         }
 
+        // Sufi Email patch: tray hosts like omarchy call the SNI Activate
+        // method on left-click. libappindicator exposes it as the "activate"
+        // GObject signal but never forwards it to the app, so clicks on the
+        // icon are dead. Connect the signal and emit a Left-click tray event,
+        // which runs the app's existing click handler (show window).
+        let event_id = id.clone();
+        unsafe {
+            use glib::prelude::ObjectExt;
+            use glib::translate::FromGlibPtrNone;
+            let obj: glib::Object = glib::Object::from_glib_none(indicator.raw().cast());
+            obj.connect_local("activate", false, move |_| {
+                crate::TrayIconEvent::send(crate::TrayIconEvent::Click {
+                    id: event_id.clone(),
+                    position: crate::dpi::PhysicalPosition::new(0.0, 0.0),
+                    rect: crate::Rect {
+                        size: crate::dpi::PhysicalSize::new(0, 0),
+                        position: crate::dpi::PhysicalPosition::new(0.0, 0.0),
+                    },
+                    button: crate::MouseButton::Left,
+                    button_state: crate::MouseButtonState::Up,
+                });
+                None
+            });
+        }
+
         Ok(Self {
             id,
             indicator,
