@@ -17,6 +17,13 @@ set -euo pipefail
 # Project root = one directory above this script's location (bin/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Make the system pkg-config files visible to the toolchain. On this
+# machine the pkg-config on PATH is Homebrew's, which only searches
+# Homebrew's own directories — tauri-cli's build-time tray check
+# (ayatana-appindicator) and the GTK stack would fail without the system
+# dirs on the path.
+export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}/home/linuxbrew/.linuxbrew/lib/pkgconfig:/home/linuxbrew/.linuxbrew/share/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig"
+
 # The tauri CLI ships as an npm devDependency (@tauri-apps/cli).
 if [ ! -x "$ROOT/node_modules/.bin/tauri" ]; then
   echo "error: tauri CLI not found — run 'npm install' in $ROOT first" >&2

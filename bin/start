@@ -24,12 +24,12 @@ RELEASE_BIN="$ROOT/src-tauri/target/release/sufi-email"
 # Detect the app binary: release (self-contained) first, then debug (dev).
 if [ -x "$RELEASE_BIN" ]; then
   LAUNCH=("$RELEASE_BIN")
-  MATCH="^$RELEASE_BIN$"
+  MATCH="target/release/sufi-email$"
 elif [ -x "$ROOT/src-tauri/target/debug/sufi-email" ]; then
   # Debug build loads the frontend from the vite dev server, so start the
   # whole tauri dev stack detached.
   LAUNCH=(npm run tauri dev)
-  MATCH="target/debug/sufi-email$"
+  MATCH="target/debug/sufi-email$|npm run tauri dev"
 else
   echo "error: no built binary found — run 'bin/build --no-bundle' (release)" >&2
   echo "       or 'npm run tauri dev' (development) first" >&2
