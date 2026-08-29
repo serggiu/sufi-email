@@ -31,6 +31,9 @@ pub struct FakeMessage {
     pub from_email: String,
     pub date: String,
     pub body: String,
+    /// Message-ID header value (with angle brackets). Kept as a field so a
+    /// COPYed message preserves it, like a real server.
+    pub message_id: String,
     /// Attachment filename when the message carries one (MIME multipart).
     pub attachment: Option<String>,
 }
@@ -50,6 +53,7 @@ impl FakeMessage {
             from_email: from_email.into(),
             date,
             body: format!("Body of '{subject}'\nLine two.\n"),
+            message_id: format!("<fake-{uid}@test>"),
             attachment: None,
         }
     }
@@ -134,8 +138,8 @@ impl FakeMessage {
 
     fn raw(&self) -> Vec<u8> {
         let mut out = format!(
-            "From: {} <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <fake-{}@test>\r\n",
-            self.from_name, self.from_email, self.subject, self.date, self.uid
+            "From: {} <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: {}\r\n",
+            self.from_name, self.from_email, self.subject, self.date, self.message_id
         );
         if self.attachment.is_some() {
             out.push_str("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"BOUND\"\r\n");
@@ -363,11 +367,25 @@ fn handle_connection(stream: TcpStream, state: FakeMailboxState) {
                 let query = args.clone();
                 let boxes = state.mailboxes.lock().unwrap();
                 let mb = boxes.get(sel).unwrap();
+                // HEADER Message-ID "<value>" — used by move_message to
+                // find a just-copied message's new UID in the destination.
+                let mid_search: Option<String> = query
+                    .split_whitespace()
+                    .position(|w| w.eq_ignore_ascii_case("MESSAGE-ID"))
+                    .and_then(|i| {
+                        query.split_whitespace().nth(i + 1).map(|v| {
+                            v.trim().trim_start_matches('"').trim_end_matches('"').to_string()
+                        })
+                    });
                 let ids: Vec<String> = mb
                     .messages
                     .iter()
                     .filter(|m| {
-                        if query.contains("UNSEEN") {
+                        if let Some(mid) = &mid_search {
+                            m.raw()
+                                .windows(mid.len())
+                                .any(|w| w == mid.as_bytes())
+                        } else if query.contains("UNSEEN") {
                             !m.flags.iter().any(|f| f == "\\Seen")
                         } else {
                             true

@@ -750,3 +750,90 @@ fn embedded_image_roundtrip_keeps_cid_reference_and_content_id() {
         assert_eq!(data, b"\x89PNG\r\n\x1a\n");
     });
 }
+
+#[test]
+fn fetch_message_ids_roundtrip() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        state.add_message(
+            "INBOX",
+            FakeMessage::new(1, "has mid", "a@b.com", 1, false),
+        );
+        let acc = test_account(&state, "FetchMids");
+        let mut session = crate::mail::imap_session_pub(&acc).unwrap();
+        session.select("INBOX").unwrap();
+
+        let ids = crate::mail::fetch_message_ids(&mut session, &[1]).unwrap();
+        assert_eq!(ids, vec![Some("fake-1@test".to_string())]);
+    });
+}
+
+#[test]
+fn move_message_returns_new_uid_in_destination() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        state.add_message("Trash", FakeMessage::new(1, "moved", "a@b.com", 1, true));
+        let acc = test_account(&state, "MoveUid");
+
+        let new_uid = block_on(crate::mail::move_message(&acc, "Trash", 1, "INBOX"))
+            .expect("move");
+        let new_uid = new_uid.expect("move must return the copy's uid");
+
+        // The copy is in INBOX with the original Message-ID preserved, and
+        // the returned uid points at it.
+        let mut session = crate::mail::imap_session_pub(&acc).unwrap();
+        session.select("INBOX").unwrap();
+        let ids = crate::mail::fetch_message_ids(&mut session, &[new_uid]).unwrap();
+        assert_eq!(ids, vec![Some("fake-1@test".to_string())]);
+    });
+}
+
+#[test]
+fn watcher_suppresses_moved_message_and_keeps_genuine_new_mail() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        // The message lives in Trash (cached); a move copies it to INBOX
+        // with a new uid but the same Message-ID.
+        state.add_message("Trash", FakeMessage::new(1, "old mail", "a@b.com", 1, true));
+        let acc = test_account(&state, "SuppressMove");
+
+        // Cache the Trash folder (so its Message-IDs are known).
+        let acc2 = acc.clone();
+        crate::mail::list_messages_streamed_blocking(&acc, "Trash", move |batch, bodies| {
+            if let Ok(mut s) = crate::store::Store::open(&acc2) {
+                let _ = s.upsert_summaries("Trash", &batch);
+                let _ = s.store_bodies("Trash", &bodies);
+            }
+        }, |_| {})
+        .expect("cache trash");
+
+        // Baseline the INBOX notified set, as if the app had synced it.
+        let mut store = crate::store::Store::open(&acc).unwrap();
+        store.new_uids_since_last_sync("INBOX", &[]).unwrap();
+
+        // Another client moves the message into INBOX (new uid server-side).
+        let new_uid = block_on(crate::mail::move_message(&acc, "Trash", 1, "INBOX"))
+            .expect("server-side move")
+            .expect("copy uid");
+
+        // The watcher sees the copy's uid as "new"...
+        let new = store.new_uids_since_last_sync("INBOX", &[new_uid]).unwrap();
+        assert_eq!(new, vec![new_uid]);
+        // ...but the filter recognizes its Message-ID as already cached
+        // (it was in Trash) and suppresses the notification.
+        let mut session = crate::mail::imap_session_pub(&acc).unwrap();
+        session.select("INBOX").unwrap();
+        let genuine = crate::filter_moved_new_uids(&acc, "INBOX", &mut session, new);
+        assert!(genuine.is_empty(), "moved message must not toast");
+
+        // A genuinely new message with a fresh Message-ID still notifies.
+        state.add_message(
+            "INBOX",
+            FakeMessage::new(3, "brand new", "new@x.org", 0, false),
+        );
+        let new2 = store.new_uids_since_last_sync("INBOX", &[3]).unwrap();
+        assert_eq!(new2, vec![3]);
+        let genuine2 = crate::filter_moved_new_uids(&acc, "INBOX", &mut session, new2);
+        assert_eq!(genuine2, vec![3]);
+    });
+}

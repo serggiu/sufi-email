@@ -429,11 +429,23 @@ async fn move_message(
         c.accounts.iter().find(|a| a.name == account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
-    mail::move_message(&acc, &folder, uid, &dest_folder).await?;
+    let new_uid = mail::move_message(&acc, &folder, uid, &dest_folder).await?;
 
-    // Remove from the source folder's cache; the copy lands in the dest
-    // folder's cache next time it syncs.
+    // Remove the row from the source folder's cache. When we can identify
+    // the copy's new UID, also move the cached row to the destination (so
+    // it shows up there instantly) and record it as already notified — a
+    // server move looks like a brand-new UID to the IDLE watcher, which
+    // would otherwise toast "new email" for a message the user just moved.
     let mut store = store::Store::open(&acc)?;
+    if let Some(new_uid) = new_uid {
+        if let Ok(all) = store.load_summaries(&folder) {
+            if let Some(mut m) = all.into_iter().find(|m| m.uid == uid) {
+                m.uid = new_uid;
+                let _ = store.upsert_summaries(&dest_folder, &[m]);
+                let _ = store.mark_notified(&dest_folder, &[new_uid]);
+            }
+        }
+    }
     store.delete_message(&folder, uid)
 }
 
@@ -787,6 +799,63 @@ fn diff_new_uids(acc: &AccountConfig, inbox: &str, uids: &[u32]) -> Vec<u32> {
     }
 }
 
+/// Split "new" UIDs into genuinely new mail vs. moves: a message moved
+/// into Inbox from another folder keeps its Message-ID, so a UID whose
+/// Message-ID is already known in the cache (any folder) is a move, not
+/// new mail. Purely a function of the fetched ids and the `known` test, so
+/// it is unit-testable without IMAP.
+fn partition_genuine_vs_moved(
+    new_uids: &[u32],
+    message_ids: &[Option<String>],
+    known: &dyn Fn(&str) -> bool,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut genuine = Vec::new();
+    let mut moved = Vec::new();
+    for (i, &uid) in new_uids.iter().enumerate() {
+        match message_ids.get(i).and_then(|m| m.as_deref()) {
+            Some(mid) if known(mid) => moved.push(uid),
+            _ => genuine.push(uid),
+        }
+    }
+    (genuine, moved)
+}
+
+/// Of the UIDs that look new, drop the ones that are actually moves into
+/// this folder (their Message-ID already exists in the cache). Returns the
+/// genuinely new UIDs; the moved ones are marked notified so they don't
+/// re-toast later. Uses the live session for one batched header fetch.
+fn filter_moved_new_uids(
+    acc: &AccountConfig,
+    inbox: &str,
+    session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
+    new_uids: Vec<u32>,
+) -> Vec<u32> {
+    if new_uids.is_empty() {
+        return new_uids;
+    }
+    let ids = match mail::fetch_message_ids(session, &new_uids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::warn!("new-mail header fetch failed: {e}; notifying as new");
+            return new_uids;
+        }
+    };
+    let Ok(mut store) = store::Store::open(acc) else {
+        return new_uids;
+    };
+    let (genuine, moved) = partition_genuine_vs_moved(&new_uids, &ids, &|mid| {
+        store.message_id_known(mid).unwrap_or(false)
+    });
+    if !moved.is_empty() {
+        log::info!(
+            "{} message(s) moved into {inbox} (not new mail), no toast",
+            moved.len()
+        );
+        let _ = store.mark_notified(inbox, &moved);
+    }
+    genuine
+}
+
 /// Sender display + subject of the newest of `new_uids`, read from the
 /// local cache (used by the slow-poll fallback, which has no live session).
 fn cached_preview(acc: &AccountConfig, inbox: &str, new_uids: &[u32]) -> (String, String, usize) {
@@ -966,6 +1035,10 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
                     }
                 };
                 let new = diff_new_uids(acc, &inbox, &uids);
+                // A message moved into Inbox from another folder (by any
+                // client) shows up as a brand-new UID here; drop those
+                // whose Message-ID is already cached so they don't toast.
+                let new = filter_moved_new_uids(acc, &inbox, &mut session, new);
                 if !new.is_empty() {
                     log::info!(
                         "new mail: {} message(s) for {} ({inbox})",
@@ -1051,6 +1124,21 @@ fn main() {
 
 #[cfg(test)]
 mod main_tests {
+    #[test]
+    fn partition_genuine_vs_moved() {
+        let known = |mid: &str| mid == "<known@x>" || mid == "<known2@x>";
+        let uids = vec![1, 2, 3, 4];
+        let ids = vec![
+            Some("<known@x>".into()),   // moved
+            None,                        // no Message-ID -> treat as new
+            Some("<fresh@x>".into()),   // genuinely new
+            Some("<known2@x>".into()),  // moved
+        ];
+        let (genuine, moved) = super::partition_genuine_vs_moved(&uids, &ids, &known);
+        assert_eq!(genuine, vec![2, 3]);
+        assert_eq!(moved, vec![1, 4]);
+    }
+
     #[test]
     fn open_private_file_creates_owner_only_file() {
         let dir = tempfile::tempdir().expect("tempdir");

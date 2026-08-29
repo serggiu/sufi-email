@@ -730,6 +730,25 @@ impl Store {
     // nothing) from later checks (notify only genuinely new UIDs) — even
     // when the folder was empty on first check.
 
+    /// Whether any cached message (in any folder) has this Message-ID.
+    ///
+    /// A message moved INTO a folder keeps its Message-ID, so a UID that
+    /// appears "new" in Inbox but whose Message-ID is already cached is a
+    /// move (or a duplicate delivery), not genuinely new mail — the
+    /// notification paths use this to avoid a false "new email" toast.
+    pub fn message_id_known(&self, message_id: &str) -> Result<bool, String> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages
+                               WHERE message_id = ?1 AND message_id != '')",
+                [message_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(exists != 0)
+    }
+
     /// UIDs already recorded for a folder.
     pub fn notified_uids(&self, folder: &str) -> Result<std::collections::HashSet<u32>, String> {
         let mut stmt = self

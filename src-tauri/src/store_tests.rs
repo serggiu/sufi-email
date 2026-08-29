@@ -917,3 +917,19 @@ fn attachment_content_id_column_migrated_from_old_schema() {
         Some(b"bytes".to_vec())
     );
 }
+
+#[test]
+fn message_id_known_detects_cached_content_across_folders() {
+    let (_dir, mut store) = test_store("mid-known");
+    store
+        .upsert_summaries("Trash", &[summary(1, "old mail", "a@b.com", 3, true)])
+        .unwrap();
+    assert!(
+        store.message_id_known("mid-1@test").unwrap(),
+        "moved message's Message-ID should be known from the Trash cache"
+    );
+    // A genuinely new message has a fresh Message-ID.
+    assert!(!store.message_id_known("brand-new@test").unwrap());
+    // Empty ids never match.
+    assert!(!store.message_id_known("").unwrap());
+}

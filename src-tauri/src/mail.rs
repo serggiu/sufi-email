@@ -872,12 +872,43 @@ pub async fn set_seen(
 /// Copy a message to another folder, then mark it \Deleted in the source.
 /// The actual expunge is left to the server (or an explicit UID EXPUNGE),
 /// which is the standard IMAP move pattern.
+/// Fetch the Message-IDs of the given UIDs in one round-trip (used by the
+/// IDLE watcher to tell moved messages apart from genuinely new mail).
+pub fn fetch_message_ids(
+    session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
+    uids: &[u32],
+) -> Result<Vec<Option<String>>, String> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set = uids
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let fetches = session
+        .uid_fetch(set, "(BODY.PEEK[HEADER])")
+        .map_err(|e| format!("FETCH failed: {e}"))?;
+    Ok(fetches
+        .iter()
+        .map(|f| {
+            f.header()
+                .and_then(|h| MessageParser::default().parse_headers(h))
+                .and_then(|m| m.message_id().map(|s| s.to_string()))
+        })
+        .collect())
+}
+
+/// Move a message to another folder (COPY + \Deleted + expunge). Returns
+/// the copy's new UID in the destination folder when it can be determined
+/// (the IMAP crate doesn't expose COPYUID, so the destination is searched
+/// by Message-ID); None when the message has no Message-ID.
 pub async fn move_message(
     acc: &AccountConfig,
     folder: &str,
     uid: u32,
     dest_folder: &str,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     let acc = acc.clone();
     let folder = folder.to_string();
     let dest = dest_folder.to_string();
@@ -886,6 +917,10 @@ pub async fn move_message(
         session
             .select(&folder)
             .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+        // Capture the Message-ID before the move so we can find the copy.
+        let message_id = fetch_message_ids(&mut session, &[uid])
+            .ok()
+            .and_then(|mut v| v.pop().flatten());
         // RFC 6851 MOVE would be ideal; most servers don't advertise it via
         // this crate, so use the portable COPY + DELETE dance.
         session
@@ -900,7 +935,19 @@ pub async fn move_message(
             .uid_expunge(format!("{uid}"))
             .or_else(|_| session.expunge())
             .map_err(|e| format!("EXPUNGE failed: {e}"))?;
-        Ok(())
+        let new_uid = match message_id {
+            Some(mid) => {
+                session
+                    .select(&dest)
+                    .map_err(|e| format!("SELECT {dest} failed: {e}"))?;
+                session
+                    .uid_search(format!("HEADER Message-ID \"{mid}\""))
+                    .ok()
+                    .and_then(|ids| ids.into_iter().max())
+            }
+            None => None,
+        };
+        Ok(new_uid)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
