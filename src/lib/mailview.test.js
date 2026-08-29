@@ -5,6 +5,8 @@ import {
   renderViewBody,
   rewriteCidImages,
   cidTokensInHtml,
+  planAttachmentDisplay,
+  cidDataMap,
 } from "./mailview.js";
 
 function mockView() {
@@ -14,6 +16,90 @@ function mockView() {
     frame: { srcdoc: "" },
   };
 }
+
+describe("planAttachmentDisplay", () => {
+  const att = (part_id, contentType, contentId, size) => ({
+    part_id,
+    contentType,
+    contentId,
+    size,
+  });
+
+  it("embeds parts the body references via cid: and gives them no thumbnail", () => {
+    const html = '<img src="cid:logo@x">';
+    const atts = [att("0", "image/png", "logo@x", 100)];
+    const plan = planAttachmentDisplay(html, atts);
+    expect(plan.cidParts).toEqual(atts);
+    expect(plan.thumbParts).toEqual([]);
+    expect(plan.wantParts).toEqual(atts);
+  });
+
+  it("keeps unreferenced parts with a Content-ID as thumbnails (regression)", () => {
+    const html = "<p>attached images should be displayed inline</p>";
+    const atts = [att("0", "image/jpeg", "f_mtee1cqi1", 265759)];
+    const plan = planAttachmentDisplay(html, atts);
+    expect(plan.cidParts).toEqual([]);
+    expect(plan.thumbParts).toEqual(atts);
+    expect(plan.wantParts).toEqual(atts);
+  });
+
+  it("mixes embedded, unreferenced, and plain attachments", () => {
+    const html = '<img src="cid:a@x">';
+    const embedded = att("0", "image/png", "a@x", 100);
+    const unreferenced = att("1", "image/jpeg", "b@x", 200);
+    const plain = att("2", "image/gif", null, 300);
+    const plan = planAttachmentDisplay(html, [embedded, unreferenced, plain]);
+    expect(plan.cidParts).toEqual([embedded]);
+    expect(plan.thumbParts).toEqual([unreferenced, plain]);
+    // wantParts: embedded parts first, then thumbnails, deduplicated.
+    expect(plan.wantParts).toEqual([embedded, unreferenced, plain]);
+  });
+
+  it("matches content-id tokens with angle brackets", () => {
+    const html = '<img src="cid:<logo@x>">';
+    const atts = [att("0", "image/png", "logo@x", 100)];
+    expect(planAttachmentDisplay(html, atts).cidParts).toEqual(atts);
+  });
+
+  it("excludes non-image and oversized parts from previews", () => {
+    const pdf = att("0", "application/pdf", null, 100);
+    const big = att("1", "image/png", null, 10 * 1024 * 1024); // > 3MB preview cap
+    const small = att("2", "image/png", null, 1024);
+    const plan = planAttachmentDisplay("<p>x</p>", [pdf, big, small]);
+    expect(plan.cidParts).toEqual([]);
+    expect(plan.thumbParts).toEqual([small]);
+    expect(plan.wantParts).toEqual([small]);
+  });
+
+  it("honors custom size limits", () => {
+    const html = '<img src="cid:big@x">';
+    const bigCid = att("0", "image/png", "big@x", 9 * 1024 * 1024); // > 8MB default cid cap
+    expect(planAttachmentDisplay(html, [bigCid]).cidParts).toEqual([]);
+    expect(planAttachmentDisplay(html, [bigCid], { maxCidBytes: 10 * 1024 * 1024 }).cidParts).toEqual([
+      bigCid,
+    ]);
+  });
+
+  it("returns empty plans for no body and empty attachments", () => {
+    expect(planAttachmentDisplay(null, [])).toEqual({
+      cidParts: [],
+      thumbParts: [],
+      wantParts: [],
+    });
+  });
+});
+
+describe("cidDataMap", () => {
+  it("builds data: URLs for embedded parts with fetched data", () => {
+    const parts = [{ part_id: "0", contentType: "image/png", contentId: "a@x" }];
+    const map = cidDataMap(parts, new Map([["0", "QUJD"]]));
+    expect(map.get("a@x")).toBe("data:image/png;base64,QUJD");
+  });
+  it("skips parts without fetched data", () => {
+    const parts = [{ part_id: "0", contentType: "image/png", contentId: "a@x" }];
+    expect(cidDataMap(parts, new Map()).size).toBe(0);
+  });
+});
 
 describe("cidTokensInHtml", () => {
   it("collects referenced cid tokens (normalized)", () => {

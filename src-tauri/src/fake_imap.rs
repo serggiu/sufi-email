@@ -103,9 +103,13 @@ impl FakeMessage {
     }
     /// body can reference it via a `cid:` URL (embedded/inline image).
     pub fn with_embedded_image(mut self, filename: &str, content_type: &str, base64: &str, cid: &str) -> Self {
+        let html_body = format!(
+            "<p>{}</p><img src=\"cid:{c}\">",
+            self.body.replace('\n', " "),
+            c = cid
+        );
         self.body = format!(
-            "--BOUND\r\nContent-Type: text/html; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: 7bit\r\n\r\n{}\r\n--BOUND\r\nContent-Type: {ct}; name=\"{f}\"\r\nContent-ID: <{c}>\r\nContent-Disposition: inline; filename=\"{f}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b}\r\n--BOUND--\r\n",
-            self.body.replace('\n', "\r\n"),
+            "--BOUND\r\nContent-Type: text/html; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: 7bit\r\n\r\n{html_body}\r\n--BOUND\r\nContent-Type: {ct}; name=\"{f}\"\r\nContent-ID: <{c}>\r\nContent-Disposition: inline; filename=\"{f}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b}\r\n--BOUND--\r\n",
             f = filename,
             ct = content_type,
             b = base64,

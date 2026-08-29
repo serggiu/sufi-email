@@ -711,3 +711,42 @@ fn embedded_image_reports_content_id() {
         assert_eq!(atts[0].content_id.as_deref(), Some("logo123@example.com"));
     });
 }
+
+#[test]
+fn embedded_image_roundtrip_keeps_cid_reference_and_content_id() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let msg = FakeMessage::new(1, "Embedded pic", "a@b.com", 1, false)
+            .with_embedded_image("logo.png", "image/png", "iVBORw0KGgo=", "logo123@example.com");
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "CidRoundtrip");
+
+        let fetched = block_on(crate::mail::fetch_message_full(&acc, "INBOX", 1))
+            .expect("fetch");
+
+        // The HTML body keeps the cid: reference verbatim, so the frontend
+        // can rewrite it to a data: URL for inline display.
+        let html = fetched.body.html.expect("html body");
+        assert!(html.contains("cid:logo123@example.com"), "body: {html}");
+
+        // Attachment metadata carries the matching content-id.
+        assert_eq!(fetched.attachments.len(), 1);
+        assert_eq!(
+            fetched.attachments[0].content_id.as_deref(),
+            Some("logo123@example.com")
+        );
+
+        // And the part data round-trips, so the rewrite has a payload.
+        let idx: usize = fetched.attachments[0].part_id.parse().unwrap();
+        let data = block_on(async {
+            let acc = acc.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::mail::fetch_attachment_part(&acc, "INBOX", 1, idx)
+            })
+            .await
+        })
+        .expect("join")
+        .expect("data");
+        assert_eq!(data, b"\x89PNG\r\n\x1a\n");
+    });
+}

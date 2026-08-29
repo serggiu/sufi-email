@@ -21,6 +21,49 @@ export function renderViewMeta(view, summary) {
     .join("  ·  ");
 }
 
+// Decide how each attachment of a message is displayed:
+//  - cidParts: image parts whose content-id the HTML body actually
+//    references via a cid: URL — they render inside the body (rewritten to
+//    data: URLs) and get no thumbnail.
+//  - thumbParts: image parts not shown in the body (unreferenced or
+//    content-id-less), small enough to preview.
+//  - wantParts: deduplicated union of both, in a stable order, for the
+//    single batched data fetch.
+export function planAttachmentDisplay(html, atts, limits = {}) {
+  const maxCidBytes = limits.maxCidBytes ?? 8 * 1024 * 1024;
+  const maxPreviewBytes = limits.maxPreviewBytes ?? 3 * 1024 * 1024;
+  const embedded = html ? cidTokensInHtml(html) : new Set();
+  const isImage = (a) => (a.contentType || "").startsWith("image/");
+  const cidParts = atts.filter(
+    (a) =>
+      a.contentId &&
+      embedded.has(String(a.contentId).toLowerCase()) &&
+      isImage(a) &&
+      a.size <= maxCidBytes
+  );
+  const thumbParts = atts.filter(
+    (a) =>
+      !embedded.has(String(a.contentId || "").toLowerCase()) &&
+      isImage(a) &&
+      a.size <= maxPreviewBytes
+  );
+  const wantParts = [...cidParts, ...thumbParts].filter(
+    (p, i, arr) => arr.findIndex((q) => q.part_id === p.part_id) === i
+  );
+  return { cidParts, thumbParts, wantParts };
+}
+
+// Build the content-id → data: URL map used to rewrite cid: references in
+// the body, from the fetched base64 payloads of the embedded parts.
+export function cidDataMap(cidParts, dataByPart) {
+  const map = new Map();
+  for (const p of cidParts) {
+    const b64 = dataByPart.get(p.part_id);
+    if (b64) map.set(p.contentId, `data:${p.contentType};base64,${b64}`);
+  }
+  return map;
+}
+
 // All `cid:` tokens referenced by an HTML email body, normalized (angle
 // brackets and surrounding whitespace stripped, lowercased). Used to decide
 // which attachment parts are genuinely embedded in the body (and should be

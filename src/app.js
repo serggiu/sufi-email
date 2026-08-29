@@ -10,7 +10,8 @@ import {
   renderViewMeta,
   renderViewBody,
   rewriteCidImages,
-  cidTokensInHtml,
+  planAttachmentDisplay,
+  cidDataMap,
 } from "./lib/mailview.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
@@ -684,25 +685,18 @@ async function moveMessage(uid, destFolder) {
 // both places. Each message body goes through the shared renderViewBody
 // (same CSP + link handling as before).
 
-// Attachments for one message inside a thread block. Image attachments get
-// small inline previews at the top, then the full list with save buttons.
-// Embedded (cid:) images are shown inside the body instead, so they are
-// skipped here. `dataByPart` maps part_id -> base64 from the single batched
+// Attachments for one message inside a thread block. Image thumbnails
+// (already filtered by planAttachmentDisplay — embedded parts are rendered
+// in the body) at the top, then the full list with save buttons.
+// `dataByPart` maps part_id -> base64 from the single batched
 // get_attachments_data call made by renderThread.
-function renderBlockAttachments(box, uid, atts, dataByPart) {
+function renderBlockAttachments(box, uid, atts, thumbParts, dataByPart) {
   if (!atts.length) return;
 
-  // Inline thumbnails for image attachments (skip very large ones to keep
-  // the IPC light — they still appear in the list with Save as…). Embedded
-  // parts are rendered in the body and filtered out by renderThread.
-  const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
-  const images = atts.filter(
-    (a) => (a.contentType || "").startsWith("image/") && a.size <= MAX_PREVIEW_BYTES
-  );
-  if (images.length) {
+  if (thumbParts.length) {
     const row = document.createElement("div");
     row.className = "att-thumbs";
-    for (const a of images) {
+    for (const a of thumbParts) {
       const b64 = dataByPart.get(a.part_id);
       if (!b64) continue;
       const img = document.createElement("img");
@@ -796,40 +790,25 @@ async function renderThread(subjectEl, metaEl, container, thread) {
     }
     if (!Array.isArray(atts)) atts = [];
 
-    // Which parts do we need data for? A part is "embedded" only when the
-    // HTML body actually references its content-id via a cid: URL — many
-    // senders add Content-ID headers to ordinary attachments too, and those
-    // must still get thumbnails. Everything is fetched in ONE round-trip
-    // and cached server-side.
+    // Plan how each part is displayed: embedded (cid:) images render in
+    // the body via data: URLs; unreferenced image parts get thumbnails.
+    // Everything is fetched in ONE round-trip and cached server-side.
     const MAX_CID_BYTES = 8 * 1024 * 1024;
     const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
-    const embedded = body && body.html ? cidTokensInHtml(body.html) : new Set();
-    const cidParts = atts.filter(
-      (a) =>
-        a.contentId &&
-        embedded.has(a.contentId.toLowerCase()) &&
-        (a.contentType || "").startsWith("image/") &&
-        a.size <= MAX_CID_BYTES
-    );
-    const thumbParts = atts.filter(
-      (a) =>
-        !embedded.has((a.contentId || "").toLowerCase()) &&
-        (a.contentType || "").startsWith("image/") &&
-        a.size <= MAX_PREVIEW_BYTES
-    );
-    const wantParts = [...cidParts, ...thumbParts].filter(
-      (p, i, arr) => arr.findIndex((q) => q.part_id === p.part_id) === i
-    );
+    const plan = planAttachmentDisplay(body && body.html, atts, {
+      maxCidBytes: MAX_CID_BYTES,
+      maxPreviewBytes: MAX_PREVIEW_BYTES,
+    });
     const dataByPart = new Map();
-    if (wantParts.length) {
+    if (plan.wantParts.length) {
       try {
         const data = await invoke("get_attachments_data", {
           account: state.account.name,
           folder: state.folder,
           uid: m.uid,
-          partIds: wantParts.map((p) => p.part_id),
+          partIds: plan.wantParts.map((p) => p.part_id),
         });
-        wantParts.forEach((p, i) => {
+        plan.wantParts.forEach((p, i) => {
           if (data && data[i]) dataByPart.set(p.part_id, data[i]);
         });
       } catch (_) {
@@ -839,13 +818,11 @@ async function renderThread(subjectEl, metaEl, container, thread) {
 
     // Rewrite cid: references to data: URLs so embedded images render in
     // the sandboxed iframe (whose CSP only allows data: images).
-    if (body && body.html) {
-      const cidMap = new Map();
-      for (const p of cidParts) {
-        const b64 = dataByPart.get(p.part_id);
-        if (b64) cidMap.set(p.contentId, `data:${p.contentType};base64,${b64}`);
-      }
-      body = { ...body, html: rewriteCidImages(body.html, cidMap) };
+    if (body && body.html && plan.cidParts.length) {
+      body = {
+        ...body,
+        html: rewriteCidImages(body.html, cidDataMap(plan.cidParts, dataByPart)),
+      };
     }
 
     if (body) {
@@ -855,7 +832,7 @@ async function renderThread(subjectEl, metaEl, container, thread) {
         // Unrenderable body: leave the block header, empty body.
       }
     }
-    renderBlockAttachments(attsBox, m.uid, atts, dataByPart);
+    renderBlockAttachments(attsBox, m.uid, atts, plan.thumbParts, dataByPart);
   }
 }
 
