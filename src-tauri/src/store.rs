@@ -342,13 +342,21 @@ impl Store {
         &self,
         folder: &str,
     ) -> Result<Vec<crate::mail::MessageSummary>, String> {
+        // Rows under an in-flight optimistic delete (pending_deletes) are
+        // hidden here so no list path can flash them back; the background
+        // delete relocates or removes them when the server confirms.
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT uid, COALESCE(subject,''), COALESCE(from_name,''), COALESCE(from_email,''),
                         date, seen, has_attachment, COALESCE(snippet,''),
                         COALESCE(message_id,''), COALESCE(refs,''), COALESCE(in_reply_to,''), COALESCE(thread_id,'')
-                 FROM messages WHERE folder = ?1 ORDER BY date DESC",
+                 FROM messages m
+                 WHERE m.folder = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_deletes pd
+                       WHERE pd.folder = m.folder AND pd.uid = m.uid)
+                 ORDER BY m.date DESC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -372,6 +380,66 @@ impl Store {
         let mut out = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         resolve_thread_ids(&mut out);
         Ok(out)
+    }
+
+    /// One cached summary by folder+uid, including rows under an in-flight
+    /// optimistic delete (they are hidden from load_summaries). Used to
+    /// relocate a deleted message's row to Trash once the server move
+    /// completes.
+    pub fn load_summary_by_uid(
+        &self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<crate::mail::MessageSummary>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT uid, COALESCE(subject,''), COALESCE(from_name,''), COALESCE(from_email,''),
+                        date, seen, has_attachment, COALESCE(snippet,''),
+                        COALESCE(message_id,''), COALESCE(refs,''), COALESCE(in_reply_to,''), COALESCE(thread_id,'')
+                 FROM messages WHERE folder = ?1 AND uid = ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![folder, uid as i64], |r| {
+                let ts: Option<i64> = r.get(4)?;
+                Ok(crate::mail::MessageSummary {
+                    uid: r.get::<_, u32>(0)?,
+                    subject: r.get(1)?,
+                    from: combine_from(r.get::<_, String>(2)?, r.get::<_, String>(3)?),
+                    date: ts.map(|t| chrono::DateTime::from_timestamp(t, 0)).flatten(),
+                    seen: r.get::<_, i64>(5)? != 0,
+                    has_attachment: r.get::<_, i64>(6)? != 0,
+                    snippet: r.get(7)?,
+                    message_id: r.get(8)?,
+                    references: r.get(9)?,
+                    in_reply_to: r.get(10)?,
+                    thread_id: r.get(11)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        match rows.next().transpose().map_err(|e| e.to_string())? {
+            None => Ok(None),
+            Some(m) => Ok(Some(m)),
+        }
+    }
+
+    /// Re-point a message's cached row to a new folder + UID (a server
+    /// move). The old row is removed; the summary lands in the destination
+    /// cache so it shows up there immediately.
+    pub fn relocate_message(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        dest: &str,
+        new_uid: u32,
+    ) -> Result<(), String> {
+        let Some(mut m) = self.load_summary_by_uid(folder, uid)? else {
+            return Ok(());
+        };
+        m.uid = new_uid;
+        self.upsert_summaries(dest, &[m])?;
+        self.delete_message(folder, uid)
     }
 
     /// All cached summaries of one conversation (thread), newest first.

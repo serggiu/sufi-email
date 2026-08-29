@@ -248,6 +248,8 @@ async fn list_messages(
     //    instead of every cached message.
     {
         let store = store::Store::open(&acc)?;
+        // load_summaries already hides rows under an in-flight optimistic
+        // delete; the pending-delete filter is belt and braces here.
         let mut cached = store.load_summaries(&folder)?;
         if cached.len() > 200 {
             cached.sort_by(|a, b| b.date.cmp(&a.date));
@@ -270,8 +272,25 @@ async fn list_messages(
     let result = mail::list_messages_streamed(
         &acc,
         &folder,
-        move |mut batch, bodies| {
+        move |mut batch, mut bodies| {
             if let Ok(mut s) = store::Store::open(&acc2) {
+                // Messages with an in-flight optimistic delete are still on
+                // the server mid-move; drop them from the outgoing batch so
+                // the UI doesn't flash them back for a moment.
+                if let Ok(pending) = s.pending_delete_uids(&folder2) {
+                    if !pending.is_empty() {
+                        let mut kept = Vec::with_capacity(batch.len());
+                        let mut kept_bodies = Vec::with_capacity(bodies.len());
+                        for (m, b) in batch.drain(..).zip(bodies.drain(..)) {
+                            if !pending.contains(&m.uid) {
+                                kept.push(m);
+                                kept_bodies.push(b);
+                            }
+                        }
+                        batch = kept;
+                        bodies = kept_bodies;
+                    }
+                }
                 if let Err(e) = s.upsert_summaries(&folder2, &batch) {
                     log::warn!("cache upsert failed: {e}");
                 }
@@ -418,12 +437,15 @@ async fn fetch_message(
     Ok(fetched.body)
 }
 
+/// Optimistic move, part 1: remove the message from the UI + shield the
+/// cached row right away (fast local call), mirroring delete. The server
+/// move runs in the background via [`move_message_server`] and relocates
+/// the row to the destination.
 #[tauri::command]
-async fn move_message(
+async fn move_message_local(
     account: String,
     folder: String,
     uid: u32,
-    dest_folder: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cfg = {
@@ -431,24 +453,56 @@ async fn move_message(
         c.accounts.iter().find(|a| a.name == account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
-    let new_uid = mail::move_message(&acc, &folder, uid, &dest_folder).await?;
-
-    // Remove the row from the source folder's cache. When we can identify
-    // the copy's new UID, also move the cached row to the destination (so
-    // it shows up there instantly) and record it as already notified — a
-    // server move looks like a brand-new UID to the IDLE watcher, which
-    // would otherwise toast "new email" for a message the user just moved.
     let mut store = store::Store::open(&acc)?;
-    if let Some(new_uid) = new_uid {
-        if let Ok(all) = store.load_summaries(&folder) {
-            if let Some(mut m) = all.into_iter().find(|m| m.uid == uid) {
-                m.uid = new_uid;
-                let _ = store.upsert_summaries(&dest_folder, &[m]);
-                let _ = store.mark_notified(&dest_folder, &[new_uid]);
+    store.mark_pending_delete(&folder, uid)
+}
+
+/// Optimistic move, part 2: the server-side move, run in the background.
+/// On success the cached row is relocated to the destination (so it shows
+/// up there immediately) and recorded as already notified — a server move
+/// looks like a brand-new UID to the IDLE watcher, which would otherwise
+/// toast "new email" for a message the user just moved.
+#[tauri::command]
+async fn move_message_server(
+    account: String,
+    folder: String,
+    uid: u32,
+    dest_folder: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cfg = {
+        let c = state.config.lock().unwrap();
+        c.accounts.iter().find(|a| a.name == account).cloned()
+    };
+    let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
+
+    let result: Result<Option<u32>, String> =
+        mail::move_message(&acc, &folder, uid, &dest_folder).await;
+
+    if let Ok(new_uid) = &result {
+        if let Ok(mut store) = store::Store::open(&acc) {
+            if let Some(new_uid) = new_uid {
+                let _ = store.relocate_message(&folder, uid, &dest_folder, *new_uid);
+                let _ = store.mark_notified(&dest_folder, &[*new_uid]);
             }
+            let _ = store.delete_message(&folder, uid);
+            let _ = store.clear_pending_delete(&folder, uid);
+        }
+    } else {
+        // Failure: unshield the row so the next folder sync re-syncs it
+        // (the message never left the source folder on the server).
+        if let Ok(mut store) = store::Store::open(&acc) {
+            let _ = store.clear_pending_delete(&folder, uid);
         }
     }
-    store.delete_message(&folder, uid)
+
+    // Refresh the UI: a user sitting in the destination folder sees the
+    // moved message appear there right away.
+    if result.is_ok() {
+        let _ = app.emit("mail-refresh", ());
+    }
+    result.map(|_| ())
 }
 
 /// Optimistic delete, part 1: remove the message from the local cache
@@ -467,23 +521,26 @@ async fn delete_message_local(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
     let mut store = store::Store::open(&acc)?;
-    store.delete_message(&folder, uid)?;
-    // Mark so a concurrent list refresh can't re-add it while the server
-    // delete is still in flight (the background delete_message_server call
-    // clears this when it finishes).
+    // Keep the row (hidden from lists by the pending-delete marker) so the
+    // background delete_message_server can relocate it into Trash's cache
+    // with the copy's new UID — deleting it here would leave Trash without
+    // the message until the next server sync.
     store.mark_pending_delete(&folder, uid)
 }
 
 /// Optimistic delete, part 2: the actual server-side delete (move to Trash,
 /// or \Deleted + expunge when there is no Trash). Runs in the background;
 /// a failure surfaces in the UI and the message reappears on the next
-/// folder sync (the reconcile re-adds UIDs still on the server).
+/// folder sync (the reconcile re-adds UIDs still on the server). On success
+/// the cached row is relocated into Trash so the deleted message is already
+/// there when the user opens it.
 #[tauri::command]
 async fn delete_message_server(
     account: String,
     folder: String,
     uid: u32,
     trash_folder: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cfg = {
@@ -492,28 +549,52 @@ async fn delete_message_server(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
 
-    let result: Result<(), String> = (|| async {
-        match trash_folder {
+    let result: Result<Option<u32>, String> = (|| async {
+        match trash_folder.clone() {
             // Move to Trash when the server has one (or the UI found one).
+            // move_message returns the copy's new UID in Trash.
             Some(trash) if trash != folder => {
-                mail::move_message(&acc, &folder, uid, &trash).await?;
+                mail::move_message(&acc, &folder, uid, &trash).await
             }
             // No Trash folder: fall back to plain IMAP delete (\Deleted + expunge).
             _ => {
                 mail::delete_message(&acc, &folder, uid).await?;
+                Ok(None)
             }
         }
-        Ok(())
     })()
     .await;
 
-    // The delete is settled either way: success means the message is gone
-    // from the server; failure means the next sync re-adds it (rollback).
-    // Either way it must no longer be shielded from refreshes.
     if let Ok(mut store) = store::Store::open(&acc) {
+        match &result {
+            // Moved to Trash: re-point the cached row to the copy's new
+            // UID so the deleted message shows up in Trash immediately.
+            Ok(Some(new_uid)) => {
+                if let Some(trash) = trash_folder.as_deref() {
+                    let _ = store.relocate_message(&folder, uid, trash, *new_uid);
+                }
+                let _ = store.delete_message(&folder, uid);
+            }
+            // Permanent delete (no Trash): drop the cached row.
+            Ok(None) => {
+                let _ = store.delete_message(&folder, uid);
+            }
+            // Failure: keep the row (still shielded by pending_delete until
+            // the next folder sync re-syncs it — the existing rollback).
+            Err(_) => {}
+        }
+        // The delete is settled either way: success means the message is gone
+        // from the server; failure means the next sync re-adds it (rollback).
+        // Either way it must no longer be shielded from refreshes.
         let _ = store.clear_pending_delete(&folder, uid);
     }
-    result
+
+    // Refresh the UI (a user sitting in Trash sees the deleted message
+    // appear there right away instead of on the next manual refresh).
+    if result.is_ok() {
+        let _ = app.emit("mail-refresh", ());
+    }
+    result.map(|_| ())
 }
 
 #[derive(serde::Serialize)]
@@ -1134,7 +1215,8 @@ fn main() {
             fetch_message,
             list_attachments,
             save_attachment,
-            move_message,
+            move_message_local,
+            move_message_server,
             delete_message_local,
             delete_message_server,
             get_thread,

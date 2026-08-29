@@ -638,41 +638,52 @@ function openMoveDialog(uid) {
 }
 
 async function moveMessage(uid, destFolder) {
+  const moved = state.messages.find((m) => m.uid === uid);
+  // 1. Remove from the UI + shield the cached row right away (fast local
+  // call), mirroring delete; the server move runs in the background.
   try {
-    const moved = state.messages.find((m) => m.uid === uid);
-    await invoke("move_message", {
+    await invoke("move_message_local", {
       account: state.account.name,
       folder: state.folder,
       uid,
-      destFolder,
     });
-    state.messages = state.messages.filter((m) => m.uid !== uid);
-    renderMessages();
-    if (loadFolderSelection(localStorage, state.account.name, state.folder) === uid) {
-      clearFolderSelection(localStorage, state.account.name, state.folder);
-    }
-    // Optimistic badge: an unread message leaves the source folder and
-    // arrives unread in the destination. The loadFolders() server refresh
-    // below reconciles both counts, but this keeps the sidebar correct the
-    // moment the move finishes instead of seconds later.
-    if (moved && !moved.seen) {
-      const src = state.folders.find((x) => x.name === state.folder);
-      if (src) src.unread = Math.max(0, (src.unread || 0) - 1);
-      const dst = state.folders.find((x) => x.name === destFolder);
-      if (dst) dst.unread = (dst.unread || 0) + 1;
-      renderFolders();
-    }
-    // Badges come from the server, not a local recompute over a possibly-
-    // incomplete message list.
-    loadFolders();
-    if (state.selectedUid === uid) {
-      state.selectedUid = null;
-      renderPreviewEmpty();
-    }
-    if (modalUid === uid) closeMessageModal();
   } catch (e) {
     showError(String(e));
+    return;
   }
+  state.messages = state.messages.filter((m) => m.uid !== uid);
+  renderMessages();
+  if (loadFolderSelection(localStorage, state.account.name, state.folder) === uid) {
+    clearFolderSelection(localStorage, state.account.name, state.folder);
+  }
+  // Optimistic badge: an unread message leaves the source folder and
+  // arrives unread in the destination. The loadFolders() server refresh
+  // below reconciles both counts, but this keeps the sidebar correct the
+  // moment the move finishes instead of seconds later.
+  if (moved && !moved.seen) {
+    const src = state.folders.find((x) => x.name === state.folder);
+    if (src) src.unread = Math.max(0, (src.unread || 0) - 1);
+    const dst = state.folders.find((x) => x.name === destFolder);
+    if (dst) dst.unread = (dst.unread || 0) + 1;
+    renderFolders();
+  }
+  // Badges come from the server, not a local recompute over a possibly-
+  // incomplete message list.
+  loadFolders();
+  if (state.selectedUid === uid) {
+    state.selectedUid = null;
+    renderPreviewEmpty();
+  }
+  if (modalUid === uid) closeMessageModal();
+  // 2. Server move in the background; on success the row lands in the
+  // destination's cache and the UI refreshes. On failure the message
+  // reappears on the next folder sync.
+  invoke("move_message_server", {
+    account: state.account.name,
+    folder: state.folder,
+    uid,
+    destFolder,
+  }).catch((e) => showError("Move failed: " + e));
 }
 
 /* ---------- preview ---------- */

@@ -933,3 +933,40 @@ fn message_id_known_detects_cached_content_across_folders() {
     // Empty ids never match.
     assert!(!store.message_id_known("").unwrap());
 }
+
+#[test]
+fn pending_delete_hides_row_from_lists_but_load_summary_by_uid_finds_it() {
+    let (_dir, mut store) = test_store("pending-hide");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    // Optimistic delete keeps the row but shields it from lists, so the
+    // background delete can relocate it to Trash afterwards.
+    store.mark_pending_delete("INBOX", 1).unwrap();
+    assert!(
+        store.load_summaries("INBOX").unwrap().is_empty(),
+        "pending-deleted row must not appear in lists"
+    );
+    assert!(
+        store.load_summary_by_uid("INBOX", 1).unwrap().is_some(),
+        "row must still be loadable by uid for relocation"
+    );
+}
+
+#[test]
+fn relocate_message_moves_row_to_destination_with_new_uid() {
+    let (_dir, mut store) = test_store("relocate");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    store.mark_pending_delete("INBOX", 1).unwrap();
+
+    store.relocate_message("INBOX", 1, "Trash", 99).unwrap();
+
+    assert!(store.load_summaries("INBOX").unwrap().is_empty());
+    let trash = store.load_summaries("Trash").unwrap();
+    assert_eq!(trash.len(), 1, "deleted message must land in Trash's cache");
+    assert_eq!(trash[0].uid, 99);
+    assert_eq!(trash[0].subject, "Hi");
+    assert_eq!(trash[0].message_id, "mid-1@test", "Message-ID survives the move");
+}
