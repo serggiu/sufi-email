@@ -1,0 +1,8 @@
+# Homebrew's pkg-config is first on PATH but only searches Homebrew's own
+# directories: it can't see the system .pc files that the dialog plugin's
+# xdg-portal backend needs (wayland-client) nor /usr/share/pkgconfig
+# (xproto, kbproto, ...), so GTK/cairo resolution fails. Use the system
+# pkgconf instead — its default search path covers the full system
+# GTK/Wayland/X11 stack.
+[env]
+PKG_CONFIG = "/usr/bin/pkg-config"

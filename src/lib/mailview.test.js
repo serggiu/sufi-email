@@ -4,6 +4,7 @@ import {
   renderViewMeta,
   renderViewBody,
   rewriteCidImages,
+  cidTokensInHtml,
 } from "./mailview.js";
 
 function mockView() {
@@ -13,6 +14,28 @@ function mockView() {
     frame: { srcdoc: "" },
   };
 }
+
+describe("cidTokensInHtml", () => {
+  it("collects referenced cid tokens (normalized)", () => {
+    const html = '<img src="cid:logo@x"><img src=cid:other@y>'; // prettier-ignore
+    const tokens = cidTokensInHtml(html);
+    expect(tokens.has("logo@x")).toBe(true);
+    expect(tokens.has("other@y")).toBe(true);
+  });
+  it("handles angle brackets and url() refs", () => {
+    const html = 'background:url(cid:bg@z) <img src="cid:<weird@w>">';
+    const tokens = cidTokensInHtml(html);
+    expect(tokens.has("bg@z")).toBe(true);
+    expect(tokens.has("weird@w")).toBe(true);
+  });
+  it("returns an empty set when nothing references cid:", () => {
+    expect(cidTokensInHtml("<p>attached images should be displayed inline</p>").size).toBe(0);
+  });
+  it("does not count http image refs", () => {
+    const tokens = cidTokensInHtml('<img src="https://x/y.png">');
+    expect(tokens.size).toBe(0);
+  });
+});
 
 describe("rewriteCidImages", () => {
   it("replaces double-quoted src cid references with data URLs", () => {

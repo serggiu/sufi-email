@@ -21,6 +21,33 @@ export function renderViewMeta(view, summary) {
     .join("  ·  ");
 }
 
+// All `cid:` tokens referenced by an HTML email body, normalized (angle
+// brackets and surrounding whitespace stripped, lowercased). Used to decide
+// which attachment parts are genuinely embedded in the body (and should be
+// rewritten to data: URLs) vs. plain attachments that merely happen to carry
+// a Content-ID header — Gmail and Apple Mail add Content-IDs to ordinary
+// attachments too.
+export function cidTokensInHtml(html) {
+  const tokens = new Set();
+  const add = (tok) => {
+    const t = String(tok || "").trim().replace(/^<+|>+$/g, "").toLowerCase();
+    if (t) tokens.add(t);
+  };
+  html.replace(
+    /(src|poster|background)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+    (m, _attr, value) => {
+      const cid = /^["']?cid:(.*?)["']?$/i.exec(value.trim());
+      if (cid) add(cid[1]);
+      return m;
+    }
+  );
+  html.replace(/url\(\s*["']?cid:([^"')]+)["']?\s*\)/gi, (m, cid) => {
+    add(cid);
+    return m;
+  });
+  return tokens;
+}
+
 // Replace `cid:` image references in an HTML email body with data: URLs, so
 // embedded images render inside the sandboxed iframe (whose CSP only allows
 // data: images). `cidMap` maps a Content-ID (without angle brackets, as

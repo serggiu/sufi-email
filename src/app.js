@@ -10,6 +10,7 @@ import {
   renderViewMeta,
   renderViewBody,
   rewriteCidImages,
+  cidTokensInHtml,
 } from "./lib/mailview.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
@@ -692,13 +693,11 @@ function renderBlockAttachments(box, uid, atts, dataByPart) {
   if (!atts.length) return;
 
   // Inline thumbnails for image attachments (skip very large ones to keep
-  // the IPC light — they still appear in the list with Save as…).
+  // the IPC light — they still appear in the list with Save as…). Embedded
+  // parts are rendered in the body and filtered out by renderThread.
   const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
   const images = atts.filter(
-    (a) =>
-      !a.contentId &&
-      (a.contentType || "").startsWith("image/") &&
-      a.size <= MAX_PREVIEW_BYTES
+    (a) => (a.contentType || "").startsWith("image/") && a.size <= MAX_PREVIEW_BYTES
   );
   if (images.length) {
     const row = document.createElement("div");
@@ -797,20 +796,24 @@ async function renderThread(subjectEl, metaEl, container, thread) {
     }
     if (!Array.isArray(atts)) atts = [];
 
-    // Which parts do we need data for? Embedded images (contentId) are
-    // rewritten into the body; plain image attachments get thumbnails.
-    // Everything is fetched in ONE round-trip and cached server-side.
+    // Which parts do we need data for? A part is "embedded" only when the
+    // HTML body actually references its content-id via a cid: URL — many
+    // senders add Content-ID headers to ordinary attachments too, and those
+    // must still get thumbnails. Everything is fetched in ONE round-trip
+    // and cached server-side.
     const MAX_CID_BYTES = 8 * 1024 * 1024;
     const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
+    const embedded = body && body.html ? cidTokensInHtml(body.html) : new Set();
     const cidParts = atts.filter(
       (a) =>
         a.contentId &&
+        embedded.has(a.contentId.toLowerCase()) &&
         (a.contentType || "").startsWith("image/") &&
         a.size <= MAX_CID_BYTES
     );
     const thumbParts = atts.filter(
       (a) =>
-        !a.contentId &&
+        !embedded.has((a.contentId || "").toLowerCase()) &&
         (a.contentType || "").startsWith("image/") &&
         a.size <= MAX_PREVIEW_BYTES
     );
@@ -892,9 +895,16 @@ function closeMessageModal() {
 }
 
 async function saveAttachment(uid, att) {
-  const path = await window.__TAURI__.dialog.save({
-    defaultPath: att.filename,
-  });
+  let path = null;
+  try {
+    path = await window.__TAURI__.dialog.save({
+      defaultPath: att.filename,
+    });
+  } catch (e) {
+    console.error("[save] dialog error", e);
+    showError("Save dialog error: " + e);
+    return;
+  }
   if (!path) return;
   try {
     await invoke("save_attachment", {
@@ -904,8 +914,10 @@ async function saveAttachment(uid, att) {
       partId: att.part_id,
       destPath: path,
     });
+    showStatus(`Saved ${att.filename}`);
   } catch (e) {
-    showError(String(e));
+    console.error("[save] invoke failed", e);
+    showError("Save failed: " + e);
   }
 }
 
