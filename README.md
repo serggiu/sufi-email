@@ -5,13 +5,30 @@ standard IMAP/SMTP accounts, fetches mail, and sends messages.
 
 ## Features (current)
 
-- Three-column UI: folders | message list | message preview
-- Collapsible folder sidebar (`Ctrl+B` or the ☰ button)
-- Messages sorted newest-first; unread messages highlighted
-- HTML and plain-text message rendering (HTML is rendered in a fully sandboxed
-  iframe — no scripts, no same-origin access)
-- Compose & send via SMTP (`Ctrl+N`), reply support
-- Config-driven accounts
+- Three-column UI: folders | message list | message preview (collapsible
+  sidebar, resizable columns)
+- **Conversation threading**: one row per thread (newest subject/from/snippet,
+  message count, unread badge); the preview pane and a double-click modal
+  show the full discussion newest-first; replies automatically join the thread
+- HTML and plain-text message rendering in a **fully sandboxed iframe** (no
+  scripts, no same-origin access); remote images are blocked (no tracking
+  pixels); links inside emails open in the system browser
+- **Attachments**: download (Save as…), inline image thumbnails, embedded
+  (cid:) images rendered inside the message body, and attaching files when
+  composing (sent as multipart/mixed)
+- **New-mail notifications**: instant IMAP IDLE push detection with desktop
+  toasts (sender + subject); moves into Inbox don't produce false "new email"
+  toasts
+- **Offline support**: folders, message lists, bodies and attachment previews
+  all read from a local cache first; read/unread changes made while offline
+  are queued and flushed when the connection returns
+- **Optimistic UI**: delete and move apply instantly with no flash-back, the
+  message lands in Trash/the destination right away, and failures roll back
+  on the next sync
+- **Multiple accounts**, added and switched from the UI; connections are
+  tested before an account is saved
+- Config-driven accounts (`config.toml`), passwords sealed with a
+  machine-local key
 
 ## Accounts
 
@@ -118,8 +135,16 @@ distros where it is supported.
 - [x] IMAP folder listing, message list, message body fetching
 - [x] SMTP sending
 - [x] Column-based UI with collapsible folders
-- [x] Mark as read/unread, move/delete messages
+- [x] Mark as read/unread, move/delete messages (optimistic, with rollback)
 - [x] In-app account management UI
 - [x] Attachment download (Save as…)
+- [x] Attachment upload in compose
+- [x] Conversation threading
+- [x] Inline image previews (thumbnails + embedded images)
+- [x] New-mail notifications (IDLE push + desktop toasts)
+- [x] Offline cache + queued read/unread sync
 - [ ] Google OAuth account support (Gmail API / XOAUTH2)
-- [ ] Attachment upload in compose
+- [ ] Full-text message search
+- [ ] Message filters/rules (auto-move, auto-archive)
+- [ ] Dark theme / theme switcher
+- [ ] Rich-text (HTML) composing with inline images
