@@ -35,8 +35,16 @@ pub struct AppState {
 /// default; `.silent()` makes that explicit on platforms that support it).
 /// Shows the sender and subject when available; `extra` is the number of
 /// additional new messages beyond the one described.
-fn fire_new_mail_notification(app: &tauri::AppHandle, from: &str, subject: &str, extra: usize) {
-    use tauri_plugin_notification::NotificationExt;
+///
+/// Runs on a plain detached thread on purpose: notify-rust's zbus blocking
+/// path must not run on a tokio worker thread. With the tokio feature
+/// (pulled in transitively by the dialog plugin's xdg-portal backend),
+/// zbus::block_on drives its own static runtime, and Runtime::block_on
+/// panics with "Cannot start a runtime from within a runtime" on a thread
+/// already inside tauri's async runtime — which is exactly where the
+/// notification plugin's internal spawn used to run `show()`, silently
+/// killing every new-mail toast.
+fn fire_new_mail_notification(from: &str, subject: &str, extra: usize) {
     let title = if from.is_empty() {
         "New email".to_string()
     } else {
@@ -50,16 +58,16 @@ fn fire_new_mail_notification(app: &tauri::AppHandle, from: &str, subject: &str,
     if extra > 0 {
         body.push_str(&format!("  (+{extra} more)"));
     }
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .silent()
-        .show()
-    {
-        log::warn!("new-mail notification failed: {e}");
-    }
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new()
+            .appname("sufi-email")
+            .summary(&title)
+            .body(&body)
+            .show()
+        {
+            log::warn!("new-mail notification failed: {e}");
+        }
+    });
 }
 
 /// Accounts for the UI — a sanitized view without the sealed passwords.
@@ -881,7 +889,7 @@ fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig) {
                     // sender/subject can come from the stored summaries.
                     warm_inbox_cache(acc, &inbox);
                     let (from, subject, extra) = cached_preview(acc, &inbox, &new);
-                    fire_new_mail_notification(app, &from, &subject, extra);
+                    fire_new_mail_notification(&from, &subject, extra);
                 }
                 flush_pending_flags(app);
                 let _ = app.emit("mail-refresh", ());
@@ -969,7 +977,7 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
                     let newest = *new.iter().max().unwrap_or(&0);
                     let (from, subject) =
                         mail::fetch_envelope_preview(&mut session, newest).unwrap_or_default();
-                    fire_new_mail_notification(app, &from, &subject, new.len() - 1);
+                    fire_new_mail_notification(&from, &subject, new.len() - 1);
                     // Warm the INBOX cache so the message is already in the
                     // list when the user opens/refreshes it — the toast
                     // should not beat the message.
@@ -1012,7 +1020,6 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             config: Mutex::new(config),
             idle_watched: Mutex::new(std::collections::HashSet::new()),
