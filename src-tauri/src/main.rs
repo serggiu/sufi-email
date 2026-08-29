@@ -224,7 +224,6 @@ async fn list_messages(
     account: String,
     folder: String,
     on_batch: tauri::ipc::Channel<Vec<mail::MessageSummary>>,
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let cfg = {
@@ -233,10 +232,17 @@ async fn list_messages(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
 
-    // 1. Instantly serve whatever we have cached locally.
+    // 1. Instantly serve whatever we have cached locally — bounded to the
+    //    newest 200 (the same window the server stream uses), so large
+    //    folders (e.g. Trash with thousands of rows) show a navigable list
+    //    instead of every cached message.
     {
         let store = store::Store::open(&acc)?;
-        let cached = store.load_summaries(&folder)?;
+        let mut cached = store.load_summaries(&folder)?;
+        if cached.len() > 200 {
+            cached.sort_by(|a, b| b.date.cmp(&a.date));
+            cached.truncate(200);
+        }
         if !cached.is_empty() {
             on_batch.send(cached).map_err(|e| e.to_string())?;
         }
@@ -251,9 +257,6 @@ async fn list_messages(
     let store_channel = on_batch.clone();
     let acc3 = acc.clone();
     let folder3 = folder.clone();
-    let reconciled: std::sync::Arc<std::sync::Mutex<Vec<u32>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let reconciled2 = reconciled.clone();
     let result = mail::list_messages_streamed(
         &acc,
         &folder,
@@ -282,7 +285,6 @@ async fn list_messages(
             let _ = store_channel.send(batch);
         },
         move |server_uids| {
-            *reconciled2.lock().unwrap() = server_uids.iter().copied().collect();
             // Remove cache rows for UIDs that vanished from the server.
             if let Ok(mut s) = store::Store::open(&acc3) {
                 match s.remove_uids_not_in(&folder3, &server_uids) {
@@ -297,6 +299,11 @@ async fn list_messages(
                 if let Err(e) = s.remove_pending_uids_not_in(&folder3, &server_uids) {
                     log::warn!("pending-flag reconcile failed: {e}");
                 }
+                // The server delete for an optimistically-deleted message
+                // finished: its UID is gone, so drop the shield.
+                if let Err(e) = s.clear_pending_deletes_not_in(&folder3, &server_uids) {
+                    log::warn!("pending-delete reconcile failed: {e}");
+                }
             }
         },
     )
@@ -304,27 +311,12 @@ async fn list_messages(
 
     // Report connectivity so the ~offline tag tracks the real state.
     match &result {
-        Ok(()) => {
-            // New-mail detection, shared with the background inbox poller:
-            // UIDs present on the server but not yet recorded fire exactly
-            // one generic notification (the first check of a folder only
-            // records the baseline).
-            let server_uids = reconciled.lock().unwrap().clone();
-            if let Ok(mut s) = store::Store::open(&acc) {
-                match s.new_uids_since_last_sync(&folder, &server_uids) {
-                    Ok(new) if !new.is_empty() => {
-                        log::info!("{}: {} new message(s), notifying", folder, new.len());
-                        // The stream just upserted the summaries, so the
-                        // sender/subject come from the cache.
-                        let (from, subject, extra) = cached_preview(&acc, &folder, &new);
-                        fire_new_mail_notification(&app, &from, &subject, extra);
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("new-mail check failed: {e}"),
-                }
-            }
-            Ok(())
-        }
+        // No new-mail notification here: the background IDLE watcher is the
+        // notifier (it watches INBOX, where new mail arrives). Detecting
+        // "new" UIDs in an arbitrary fetched folder would fire toasts for
+        // messages merely moved into it (e.g. an unread message deleted to
+        // Trash), which is not new mail.
+        Ok(()) => Ok(()),
         Err(e) => {
             // Serve-from-cache already happened; report offline instead of
             // failing so the UI can show the tag.
@@ -453,7 +445,11 @@ async fn delete_message_local(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
     let mut store = store::Store::open(&acc)?;
-    store.delete_message(&folder, uid)
+    store.delete_message(&folder, uid)?;
+    // Mark so a concurrent list refresh can't re-add it while the server
+    // delete is still in flight (the background delete_message_server call
+    // clears this when it finishes).
+    store.mark_pending_delete(&folder, uid)
 }
 
 /// Optimistic delete, part 2: the actual server-side delete (move to Trash,
@@ -474,17 +470,28 @@ async fn delete_message_server(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
 
-    match trash_folder {
-        // Move to Trash when the server has one (or the UI found one).
-        Some(trash) if trash != folder => {
-            mail::move_message(&acc, &folder, uid, &trash).await?;
+    let result: Result<(), String> = (|| async {
+        match trash_folder {
+            // Move to Trash when the server has one (or the UI found one).
+            Some(trash) if trash != folder => {
+                mail::move_message(&acc, &folder, uid, &trash).await?;
+            }
+            // No Trash folder: fall back to plain IMAP delete (\Deleted + expunge).
+            _ => {
+                mail::delete_message(&acc, &folder, uid).await?;
+            }
         }
-        // No Trash folder: fall back to plain IMAP delete (\Deleted + expunge).
-        _ => {
-            mail::delete_message(&acc, &folder, uid).await?;
-        }
+        Ok(())
+    })()
+    .await;
+
+    // The delete is settled either way: success means the message is gone
+    // from the server; failure means the next sync re-adds it (rollback).
+    // Either way it must no longer be shielded from refreshes.
+    if let Ok(mut store) = store::Store::open(&acc) {
+        let _ = store.clear_pending_delete(&folder, uid);
     }
-    Ok(())
+    result
 }
 
 #[derive(serde::Serialize)]
@@ -970,6 +977,7 @@ mod main_tests {
         }
     }
 }
+
 
 #[cfg(test)]
 mod manual_send_tests {

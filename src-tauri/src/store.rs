@@ -59,6 +59,12 @@ impl Store {
     }
 
     fn init_connection(conn: Connection, path: &std::path::Path) -> Result<Store, String> {
+        // Concurrent workers (IDLE watcher, poller, UI commands) each open
+        // their own connection; WAL allows one writer at a time, so give
+        // writers a generous window instead of failing with "database is
+        // locked" on transient contention.
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(|e| e.to_string())?;
         // 0600: the mail cache belongs to the user alone.
         #[cfg(unix)]
         {
@@ -130,6 +136,14 @@ impl Store {
                  uid    INTEGER NOT NULL,
                  seen   INTEGER NOT NULL,
                  PRIMARY KEY (folder, uid)
+             );
+             -- Messages optimistically deleted from the local cache whose
+             -- server-side delete (move to Trash / expunge) is still in
+             -- flight. While marked, list refreshes must not re-add them.
+             CREATE TABLE IF NOT EXISTS pending_deletes (
+                 folder TEXT NOT NULL,
+                 uid    INTEGER NOT NULL,
+                 PRIMARY KEY (folder, uid)
              );",
         )
         .map_err(|e| e.to_string())?;
@@ -153,9 +167,15 @@ impl Store {
         // wins over the server's flags so a list refresh can't flash a
         // message back to stale unread while the STORE is still in flight.
         let pending = self.pending_seen_map(folder)?;
+        // Optimistically-deleted messages must not come back while the
+        // server delete is still in flight.
+        let pending_deletes = self.pending_delete_uids(folder)?;
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
         let mut inserted = 0;
         for m in summaries {
+            if pending_deletes.contains(&m.uid) {
+                continue;
+            }
             let seen = pending.get(&m.uid).copied().unwrap_or(m.seen);
             let date: Option<i64> = m.date.map(|d| d.timestamp());
             let hash = content_hash(&m.from, date, &m.subject);
@@ -632,6 +652,61 @@ impl Store {
         for (pf, uid, _) in pending {
             if pf == folder && !server_uids.contains(&uid) {
                 self.remove_pending_flag(&folder, uid)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------- pending deletes
+    //
+    // Optimistic deletes: the row is removed from the cache immediately and
+    // marked here so a concurrent list refresh (which may still see the
+    // message on the server while the delete is in flight) cannot re-add it.
+
+    pub fn mark_pending_delete(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_deletes (folder, uid) VALUES (?1, ?2)",
+                rusqlite::params![folder, uid as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_pending_delete(&mut self, folder: &str, uid: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_deletes WHERE folder = ?1 AND uid = ?2",
+                rusqlite::params![folder, uid as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn pending_delete_uids(&self, folder: &str) -> Result<std::collections::HashSet<u32>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid FROM pending_deletes WHERE folder = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<std::collections::HashSet<i64>, _>>()
+            .map(|s| s.into_iter().map(|u| u as u32).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Drop pending-delete markers for messages that are no longer on the
+    /// server (the delete finished, possibly while we weren't watching).
+    pub fn clear_pending_deletes_not_in(
+        &mut self,
+        folder: &str,
+        server_uids: &std::collections::HashSet<u32>,
+    ) -> Result<(), String> {
+        let pending = self.pending_delete_uids(folder)?;
+        for uid in pending {
+            if !server_uids.contains(&uid) {
+                self.clear_pending_delete(folder, uid)?;
             }
         }
         Ok(())

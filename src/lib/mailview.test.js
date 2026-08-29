@@ -41,21 +41,23 @@ describe("renderViewMeta", () => {
 });
 
 describe("renderViewBody", () => {
-  it("renders HTML when present, sandboxed with CSP", () => {
+  it("renders HTML when present, sandboxed with CSP", async () => {
     const view = mockView();
-    renderViewBody(view, { html: "<html><head></head><body>hi</body></html>" });
+    await renderViewBody(view, { html: "<html><head></head><body>hi</body></html>" });
     expect(view.frame.srcdoc).toContain('Content-Security-Policy');
     expect(view.frame.srcdoc).toContain("hi");
   });
-  it("escapes plain-text bodies into a <pre>", () => {
+  it("escapes plain-text bodies into a <pre>", async () => {
     const view = mockView();
-    renderViewBody(view, { text: "<script>alert(1)</script>" });
-    expect(view.frame.srcdoc).toContain("&lt;script&gt;");
-    expect(view.frame.srcdoc).not.toContain("<script>");
+    await renderViewBody(view, { text: "<script>alert(1)</script>" });
+    // The email's script is escaped (inert); the only real <script> in the
+    // document is the app's own link handler.
+    expect(view.frame.srcdoc).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(view.frame.srcdoc).not.toContain(">alert(1)<");
   });
-  it("shows an empty-message placeholder", () => {
+  it("shows an empty-message placeholder", async () => {
     const view = mockView();
-    renderViewBody(view, {});
+    await renderViewBody(view, {});
     expect(view.frame.srcdoc).toContain("(empty message)");
   });
 });

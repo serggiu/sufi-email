@@ -24,11 +24,11 @@ export function renderViewMeta(view, summary) {
 // Render inside a fully sandboxed iframe (no scripts, no same-origin).
 // A CSP meta tag additionally blocks remote resources — most importantly
 // remote images, so tracking pixels in HTML mail cannot phone home.
-export function renderViewBody(view, body) {
+export async function renderViewBody(view, body) {
   const content =
     body.html ??
     `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(
       body.text ?? "(empty message)"
     )}</pre>`;
-  view.frame.srcdoc = withEmailCsp(content);
+  view.frame.srcdoc = await withEmailCsp(content);
 }

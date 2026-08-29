@@ -597,6 +597,7 @@ function openMoveDialog(uid) {
 
 async function moveMessage(uid, destFolder) {
   try {
+    const moved = state.messages.find((m) => m.uid === uid);
     await invoke("move_message", {
       account: state.account.name,
       folder: state.folder,
@@ -607,6 +608,17 @@ async function moveMessage(uid, destFolder) {
     renderMessages();
     if (loadFolderSelection(localStorage, state.account.name, state.folder) === uid) {
       clearFolderSelection(localStorage, state.account.name, state.folder);
+    }
+    // Optimistic badge: an unread message leaves the source folder and
+    // arrives unread in the destination. The loadFolders() server refresh
+    // below reconciles both counts, but this keeps the sidebar correct the
+    // moment the move finishes instead of seconds later.
+    if (moved && !moved.seen) {
+      const src = state.folders.find((x) => x.name === state.folder);
+      if (src) src.unread = Math.max(0, (src.unread || 0) - 1);
+      const dst = state.folders.find((x) => x.name === destFolder);
+      if (dst) dst.unread = (dst.unread || 0) + 1;
+      renderFolders();
     }
     // Badges come from the server, not a local recompute over a possibly-
     // incomplete message list.
@@ -687,13 +699,13 @@ function renderPreviewEmpty() {
   $("preview-content").classList.add("hidden");
 }
 
-function renderPreview(body) {
+async function renderPreview(body) {
   const summary = state.messages.find((m) => m.uid === body.uid) || {};
   $("preview-empty").classList.add("hidden");
   $("preview-content").classList.remove("hidden");
   renderViewSubject(columnView, summary);
   renderViewMeta(columnView, summary);
-  renderViewBody(columnView, body);
+  await renderViewBody(columnView, body);
   renderViewAttachments(columnView, body.uid);
 }
 
@@ -712,7 +724,7 @@ async function openMessageModal(uid) {
     });
     renderViewSubject(modalView, summary);
     renderViewMeta(modalView, summary);
-    renderViewBody(modalView, body);
+    await renderViewBody(modalView, body);
     renderViewAttachments(modalView, uid);
     $("message-modal").showModal();
     // Double-clicking is an explicit read: mark immediately.
@@ -1113,6 +1125,20 @@ function initMailRefreshListener() {
   });
 }
 
+// Links inside the sandboxed email iframes are intercepted by a nonce'd
+// script (see withEmailCsp) and forwarded here, so they open in the
+// system's default browser instead of being dead. Only http(s) URLs are
+// ever opened.
+function initExternalLinks() {
+  if (!window.__TAURI__ || !window.__TAURI__.opener) return;
+  window.addEventListener("message", (e) => {
+    if (!e.data || e.data.type !== "sufi-open-url") return;
+    const url = e.data.url;
+    if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return;
+    window.__TAURI__.opener.openUrl(url).catch((err) => showError(String(err)));
+  });
+}
+
 function init() {
   if (!guardTauri()) return;
 
@@ -1127,6 +1153,7 @@ function init() {
   $("refresh-btn").addEventListener("click", refreshMail);
 
   initMailRefreshListener();
+  initExternalLinks();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   document.getElementById("compose-form").addEventListener("submit", sendCompose);
   $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());

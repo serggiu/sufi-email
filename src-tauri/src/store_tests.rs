@@ -575,3 +575,43 @@ fn store_bodies_keeps_previous_body_when_updated() {
     let (text, _html) = store.load_body("INBOX", 1).unwrap().expect("body survives upsert");
     assert_eq!(text.as_deref(), Some("v1"));
 }
+
+// ---------------------------------------------------- pending deletes
+
+#[test]
+fn pending_delete_prevents_re_add_while_in_flight() {
+    let (_dir, mut store) = test_store("pending-del");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+
+    // Optimistic delete: remove + mark pending.
+    store.delete_message("INBOX", 1).unwrap();
+    store.mark_pending_delete("INBOX", 1).unwrap();
+    assert!(store.load_summaries("INBOX").unwrap().is_empty());
+
+    // A concurrent refresh still sees the message on the server — it must
+    // NOT re-add it while the delete is in flight.
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hi", "a@b.com", 1, false)])
+        .unwrap();
+    assert!(store.load_summaries("INBOX").unwrap().is_empty());
+}
+
+#[test]
+fn pending_delete_cleared_when_server_confirms() {
+    let (_dir, mut store) = test_store("pending-del-confirm");
+    store.mark_pending_delete("INBOX", 7).unwrap();
+    assert!(store.pending_delete_uids("INBOX").unwrap().contains(&7));
+
+    // Server reconcile: uid 7 is no longer on the server -> delete finished.
+    let server: std::collections::HashSet<u32> = [].into_iter().collect();
+    store.clear_pending_deletes_not_in("INBOX", &server).unwrap();
+    assert!(!store.pending_delete_uids("INBOX").unwrap().contains(&7));
+
+    // If still on the server (delete failed / still in flight), keep it.
+    store.mark_pending_delete("INBOX", 8).unwrap();
+    let server: std::collections::HashSet<u32> = [8].into_iter().collect();
+    store.clear_pending_deletes_not_in("INBOX", &server).unwrap();
+    assert!(store.pending_delete_uids("INBOX").unwrap().contains(&8));
+}
