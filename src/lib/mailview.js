@@ -21,6 +21,32 @@ export function renderViewMeta(view, summary) {
     .join("  ·  ");
 }
 
+// Replace `cid:` image references in an HTML email body with data: URLs, so
+// embedded images render inside the sandboxed iframe (whose CSP only allows
+// data: images). `cidMap` maps a Content-ID (without angle brackets, as
+// reported by the backend) to a full data: URL. References without a matching
+// part are left untouched.
+export function rewriteCidImages(html, cidMap) {
+  const lookup = (cid) => {
+    const key = String(cid || "").trim().replace(/^<+|>+$/g, "");
+    return cidMap.get(key) || "";
+  };
+  return html
+    .replace(
+      /(src|poster|background)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+      (match, attr, value) => {
+        const cid = /^["']?cid:(.*?)["']?$/i.exec(value.trim());
+        if (!cid) return match;
+        const url = lookup(cid[1]);
+        return url ? `${attr}="${url}"` : match;
+      }
+    )
+    .replace(/url\(\s*["']?cid:([^"')]+)["']?\s*\)/gi, (match, cid) => {
+      const url = lookup(cid);
+      return url ? `url("${url}")` : match;
+    });
+}
+
 // Render inside a fully sandboxed iframe (no scripts, no same-origin).
 // A CSP meta tag additionally blocks remote resources — most importantly
 // remote images, so tracking pixels in HTML mail cannot phone home.

@@ -9,6 +9,7 @@ import {
   renderViewSubject,
   renderViewMeta,
   renderViewBody,
+  rewriteCidImages,
 } from "./lib/mailview.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
@@ -684,46 +685,34 @@ async function moveMessage(uid, destFolder) {
 
 // Attachments for one message inside a thread block. Image attachments get
 // small inline previews at the top, then the full list with save buttons.
-async function renderBlockAttachments(box, uid) {
-  let atts = [];
-  try {
-    atts = await invoke("list_attachments", {
-      account: state.account.name,
-      folder: state.folder,
-      uid,
-    });
-  } catch (_) {
-    return; // attachment listing is best-effort
-  }
+// Embedded (cid:) images are shown inside the body instead, so they are
+// skipped here. `dataByPart` maps part_id -> base64 from the single batched
+// get_attachments_data call made by renderThread.
+function renderBlockAttachments(box, uid, atts, dataByPart) {
   if (!atts.length) return;
 
   // Inline thumbnails for image attachments (skip very large ones to keep
   // the IPC light — they still appear in the list with Save as…).
   const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
   const images = atts.filter(
-    (a) => (a.contentType || "").startsWith("image/") && a.size <= MAX_PREVIEW_BYTES
+    (a) =>
+      !a.contentId &&
+      (a.contentType || "").startsWith("image/") &&
+      a.size <= MAX_PREVIEW_BYTES
   );
   if (images.length) {
     const row = document.createElement("div");
     row.className = "att-thumbs";
     for (const a of images) {
-      try {
-        const b64 = await invoke("get_attachment_data", {
-          account: state.account.name,
-          folder: state.folder,
-          uid,
-          partId: a.part_id,
-        });
-        const img = document.createElement("img");
-        img.className = "att-thumb";
-        img.src = `data:${a.contentType};base64,${b64}`;
-        img.title = a.filename;
-        img.alt = a.filename;
-        img.addEventListener("click", () => saveAttachment(uid, a));
-        row.appendChild(img);
-      } catch (_) {
-        // Individual preview failure is fine; the list entry remains.
-      }
+      const b64 = dataByPart.get(a.part_id);
+      if (!b64) continue;
+      const img = document.createElement("img");
+      img.className = "att-thumb";
+      img.src = `data:${a.contentType};base64,${b64}`;
+      img.title = a.filename;
+      img.alt = a.filename;
+      img.addEventListener("click", () => saveAttachment(uid, a));
+      row.appendChild(img);
     }
     if (row.childElementCount) box.appendChild(row);
   }
@@ -780,23 +769,90 @@ async function renderThread(subjectEl, metaEl, container, thread) {
     const frame = document.createElement("iframe");
     frame.className = "thread-msg-frame";
     frame.sandbox = "allow-scripts";
-    const atts = document.createElement("div");
-    atts.className = "thread-msg-atts";
+    const attsBox = document.createElement("div");
+    attsBox.className = "thread-msg-atts";
 
-    block.append(head, frame, atts);
+    block.append(head, frame, attsBox);
     container.appendChild(block);
 
+    // Body + attachment metadata in parallel (attachment listing is
+    // best-effort and never blocks the body).
+    let body = null;
+    let atts = [];
     try {
-      const body = await invoke("fetch_message", {
-        account: state.account.name,
-        folder: state.folder,
-        uid: m.uid,
-      });
-      await renderViewBody({ frame }, body);
+      [body, atts] = await Promise.all([
+        invoke("fetch_message", {
+          account: state.account.name,
+          folder: state.folder,
+          uid: m.uid,
+        }),
+        invoke("list_attachments", {
+          account: state.account.name,
+          folder: state.folder,
+          uid: m.uid,
+        }).catch(() => []),
+      ]);
     } catch (_) {
       // Offline or not cached: leave the block header, empty body.
     }
-    await renderBlockAttachments(atts, m.uid);
+    if (!Array.isArray(atts)) atts = [];
+
+    // Which parts do we need data for? Embedded images (contentId) are
+    // rewritten into the body; plain image attachments get thumbnails.
+    // Everything is fetched in ONE round-trip and cached server-side.
+    const MAX_CID_BYTES = 8 * 1024 * 1024;
+    const MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
+    const cidParts = atts.filter(
+      (a) =>
+        a.contentId &&
+        (a.contentType || "").startsWith("image/") &&
+        a.size <= MAX_CID_BYTES
+    );
+    const thumbParts = atts.filter(
+      (a) =>
+        !a.contentId &&
+        (a.contentType || "").startsWith("image/") &&
+        a.size <= MAX_PREVIEW_BYTES
+    );
+    const wantParts = [...cidParts, ...thumbParts].filter(
+      (p, i, arr) => arr.findIndex((q) => q.part_id === p.part_id) === i
+    );
+    const dataByPart = new Map();
+    if (wantParts.length) {
+      try {
+        const data = await invoke("get_attachments_data", {
+          account: state.account.name,
+          folder: state.folder,
+          uid: m.uid,
+          partIds: wantParts.map((p) => p.part_id),
+        });
+        wantParts.forEach((p, i) => {
+          if (data && data[i]) dataByPart.set(p.part_id, data[i]);
+        });
+      } catch (_) {
+        // Preview failure is fine; the attachment list entry remains.
+      }
+    }
+
+    // Rewrite cid: references to data: URLs so embedded images render in
+    // the sandboxed iframe (whose CSP only allows data: images).
+    if (body && body.html) {
+      const cidMap = new Map();
+      for (const p of cidParts) {
+        const b64 = dataByPart.get(p.part_id);
+        if (b64) cidMap.set(p.contentId, `data:${p.contentType};base64,${b64}`);
+      }
+      body = { ...body, html: rewriteCidImages(body.html, cidMap) };
+    }
+
+    if (body) {
+      try {
+        await renderViewBody({ frame }, body);
+      } catch (_) {
+        // Unrenderable body: leave the block header, empty body.
+      }
+    }
+    renderBlockAttachments(attsBox, m.uid, atts, dataByPart);
   }
 }
 

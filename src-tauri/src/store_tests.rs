@@ -202,6 +202,7 @@ fn delete_message_removes_row_and_attachments() {
                 content_type: "application/pdf".into(),
                 size: 1234,
                 part_id: "0".into(),
+                content_id: None,
             }],
         )
         .unwrap();
@@ -250,12 +251,14 @@ fn attachments_roundtrip() {
             content_type: "application/pdf".into(),
             size: 100,
             part_id: "0".into(),
+            content_id: None,
         },
         AttachmentMeta {
             filename: "b.png".into(),
             content_type: "image/png".into(),
             size: 200,
             part_id: "1".into(),
+            content_id: None,
         },
     ];
     store.store_body("INBOX", 1, Some("body"), None, &atts).unwrap();
@@ -279,6 +282,7 @@ fn store_body_replaces_old_attachments() {
         content_type: "text/plain".into(),
         size: 1,
         part_id: "0".into(),
+        content_id: None,
     }];
     store.store_body("INBOX", 1, Some("b"), None, &v1).unwrap();
 
@@ -287,6 +291,7 @@ fn store_body_replaces_old_attachments() {
         content_type: "text/plain".into(),
         size: 2,
         part_id: "0".into(),
+        content_id: None,
     }];
     store.store_body("INBOX", 1, Some("b"), None, &v2).unwrap();
 
@@ -696,6 +701,7 @@ fn store_bodies_caches_attachment_metadata() {
                     content_type: "image/png".into(),
                     size: 42,
                     part_id: "0".into(),
+                    content_id: None,
                 }],
             }],
         )
@@ -704,4 +710,210 @@ fn store_bodies_caches_attachment_metadata() {
     assert_eq!(atts.len(), 1);
     assert_eq!(atts[0].filename, "photo.png");
     assert_eq!(atts[0].content_type, "image/png");
+}
+
+#[test]
+fn attachment_data_roundtrip_and_batch_load() {
+    let (_dir, mut store) = test_store("att-data");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "mail", "a@b.com", 1, false)])
+        .unwrap();
+    store
+        .store_body(
+            "INBOX",
+            1,
+            Some("b"),
+            None,
+            &[AttachmentMeta {
+                filename: "a.png".into(),
+                content_type: "image/png".into(),
+                size: 100,
+                part_id: "0".into(),
+                content_id: Some("a@x".into()),
+            }],
+        )
+        .unwrap();
+
+    // Nothing cached yet.
+    assert!(store.load_attachment_data("INBOX", 1, "0").unwrap().is_none());
+
+    store
+        .store_attachment_data("INBOX", 1, "0", b"png-bytes")
+        .unwrap();
+    assert_eq!(
+        store.load_attachment_data("INBOX", 1, "0").unwrap(),
+        Some(b"png-bytes".to_vec())
+    );
+    // Updating the same part replaces the bytes.
+    store
+        .store_attachment_data("INBOX", 1, "0", b"newer")
+        .unwrap();
+    assert_eq!(
+        store.load_attachment_data("INBOX", 1, "0").unwrap(),
+        Some(b"newer".to_vec())
+    );
+
+    // Batch load aligns with the requested part ids.
+    let got = store
+        .load_attachments_data("INBOX", 1, &["0".into(), "1".into(), "2".into()])
+        .unwrap();
+    assert_eq!(got, vec![Some(b"newer".to_vec()), None, None]);
+
+    // Batch store.
+    store
+        .store_attachments_data(
+            "INBOX",
+            1,
+            &[("1".into(), b"one".to_vec()), ("2".into(), b"two".to_vec())],
+        )
+        .unwrap();
+    let got = store
+        .load_attachments_data("INBOX", 1, &["0".into(), "1".into(), "2".into()])
+        .unwrap();
+    assert_eq!(
+        got,
+        vec![Some(b"newer".to_vec()), Some(b"one".to_vec()), Some(b"two".to_vec())]
+    );
+
+    // Content-id survives the meta round-trip through the store.
+    let atts = store.load_attachments("INBOX", 1).unwrap();
+    assert_eq!(atts[0].content_id.as_deref(), Some("a@x"));
+}
+
+#[test]
+fn attachment_data_survives_body_refresh() {
+    let (_dir, mut store) = test_store("att-data-refresh");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "mail", "a@b.com", 1, false)])
+        .unwrap();
+    let atts = vec![AttachmentMeta {
+        filename: "a.png".into(),
+        content_type: "image/png".into(),
+        size: 100,
+        part_id: "0".into(),
+        content_id: None,
+    }];
+    store.store_body("INBOX", 1, Some("b1"), None, &atts).unwrap();
+    store.store_attachment_data("INBOX", 1, "0", b"bytes").unwrap();
+
+    // Body warm-up rewrites the metadata rows but must not wipe cached data.
+    store
+        .store_bodies(
+            "INBOX",
+            &[crate::mail::BatchBody {
+                uid: 1,
+                text: Some("b2".into()),
+                html: None,
+                attachments: atts.clone(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_attachment_data("INBOX", 1, "0").unwrap(),
+        Some(b"bytes".to_vec())
+    );
+}
+
+#[test]
+fn attachment_data_pruned_when_part_disappears() {
+    let (_dir, mut store) = test_store("att-data-prune");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "mail", "a@b.com", 1, false)])
+        .unwrap();
+    let atts = vec![
+        AttachmentMeta {
+            filename: "a.png".into(),
+            content_type: "image/png".into(),
+            size: 1,
+            part_id: "0".into(),
+            content_id: None,
+        },
+        AttachmentMeta {
+            filename: "b.pdf".into(),
+            content_type: "application/pdf".into(),
+            size: 2,
+            part_id: "1".into(),
+            content_id: None,
+        },
+    ];
+    store.store_body("INBOX", 1, Some("b"), None, &atts).unwrap();
+    store
+        .store_attachments_data("INBOX", 1, &[("0".into(), b"a".to_vec()), ("1".into(), b"b".to_vec())])
+        .unwrap();
+
+    // Server message now only has one part: the other's cached bytes go away.
+    store
+        .store_body(
+            "INBOX",
+            1,
+            Some("b"),
+            None,
+            &[AttachmentMeta {
+                filename: "a.png".into(),
+                content_type: "image/png".into(),
+                size: 1,
+                part_id: "0".into(),
+                content_id: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_attachment_data("INBOX", 1, "0").unwrap(),
+        Some(b"a".to_vec())
+    );
+    assert!(store.load_attachment_data("INBOX", 1, "1").unwrap().is_none());
+}
+
+#[test]
+fn attachment_content_id_column_migrated_from_old_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("migrated.db");
+    // Simulate a database created by an older version: the attachments
+    // table has no content_id column yet.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            rowid_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder TEXT NOT NULL, uid INTEGER NOT NULL,
+            message_id TEXT NOT NULL DEFAULT '', refs TEXT NOT NULL DEFAULT '',
+            in_reply_to TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '', subject TEXT, from_name TEXT,
+            from_email TEXT, date INTEGER, seen INTEGER NOT NULL DEFAULT 0,
+            has_attachment INTEGER NOT NULL DEFAULT 0, snippet TEXT,
+            body_text TEXT, body_html TEXT);
+         CREATE TABLE attachments (
+            msg_row INTEGER NOT NULL REFERENCES messages(rowid_pk) ON DELETE CASCADE,
+            part_id TEXT NOT NULL, filename TEXT, mime TEXT, size INTEGER);
+         CREATE UNIQUE INDEX idx_messages_folder_uid ON messages(folder, uid);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = Store::open_in(dir.path(), "migrated@test").unwrap();
+    store
+        .upsert_summaries("INBOX", &[summary(1, "m", "a@b.com", 1, false)])
+        .unwrap();
+    store
+        .store_body(
+            "INBOX",
+            1,
+            Some("b"),
+            None,
+            &[AttachmentMeta {
+                filename: "x.png".into(),
+                content_type: "image/png".into(),
+                size: 1,
+                part_id: "0".into(),
+                content_id: Some("cid@x".into()),
+            }],
+        )
+        .unwrap();
+    let atts = store.load_attachments("INBOX", 1).unwrap();
+    assert_eq!(atts[0].content_id.as_deref(), Some("cid@x"));
+    // The attachment-data cache table was created by the migration too.
+    store.store_attachment_data("INBOX", 1, "0", b"bytes").unwrap();
+    assert_eq!(
+        store.load_attachment_data("INBOX", 1, "0").unwrap(),
+        Some(b"bytes".to_vec())
+    );
 }

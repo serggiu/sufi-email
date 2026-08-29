@@ -1096,14 +1096,19 @@ pub async fn send_email(
     Ok(())
 }
 
-/// Fetch one attachment part (by its position in the attachments iterator)
-/// from the server. Shared by save and thumbnail previews.
-pub(crate) fn fetch_attachment_part(
+/// Fetch attachment parts (by their position in the attachments iterator)
+/// from the server with a single round-trip: one full-message FETCH, one
+/// parse, then extract every requested part. Shared by save and thumbnail
+/// previews — previews used to re-download the whole message once per image.
+pub(crate) fn fetch_attachment_parts(
     acc: &AccountConfig,
     folder: &str,
     uid: u32,
-    part_index: usize,
-) -> Result<Vec<u8>, String> {
+    part_indexes: &[usize],
+) -> Result<Vec<Vec<u8>>, String> {
+    if part_indexes.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut session = imap_session(acc)?;
     session
         .select(folder)
@@ -1119,15 +1124,31 @@ pub(crate) fn fetch_attachment_part(
         .to_vec();
     let msg = MessageParser::default().parse(&raw).ok_or("unparseable message")?;
     let parts: Vec<_> = msg.attachments().collect();
-    let part = parts
-        .get(part_index)
-        .ok_or_else(|| format!("attachment {part_index} not found"))?;
-    Ok(match &part.body {
-        mail_parser::PartType::Binary(b) | mail_parser::PartType::InlineBinary(b) => b.to_vec(),
-        mail_parser::PartType::Text(t) | mail_parser::PartType::Html(t) => t.as_bytes().to_vec(),
-        mail_parser::PartType::Message(m) => m.raw_message().to_vec(),
-        mail_parser::PartType::Multipart(_) => Vec::new(),
-    })
+    let mut out = Vec::with_capacity(part_indexes.len());
+    for &idx in part_indexes {
+        let part = parts
+            .get(idx)
+            .ok_or_else(|| format!("attachment {idx} not found"))?;
+        let data = match &part.body {
+            mail_parser::PartType::Binary(b) | mail_parser::PartType::InlineBinary(b) => b.to_vec(),
+            mail_parser::PartType::Text(t) | mail_parser::PartType::Html(t) => t.as_bytes().to_vec(),
+            mail_parser::PartType::Message(m) => m.raw_message().to_vec(),
+            mail_parser::PartType::Multipart(_) => Vec::new(),
+        };
+        out.push(data);
+    }
+    Ok(out)
+}
+
+/// Fetch one attachment part (by its position in the attachments iterator)
+/// from the server.
+pub(crate) fn fetch_attachment_part(
+    acc: &AccountConfig,
+    folder: &str,
+    uid: u32,
+    part_index: usize,
+) -> Result<Vec<u8>, String> {
+    fetch_attachment_parts(acc, folder, uid, &[part_index]).map(|mut v| v.pop().unwrap_or_default())
 }
 
 /// Attachment metadata for a message, extracted from the raw server message.

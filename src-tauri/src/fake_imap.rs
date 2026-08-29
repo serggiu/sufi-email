@@ -81,6 +81,40 @@ impl FakeMessage {
         self
     }
 
+    /// Append another image part to an existing multipart message (the
+    /// builder methods create single-attachment messages; this extends them).
+    pub fn add_image_attachment(mut self, filename: &str, content_type: &str, base64: &str) -> Self {
+        let part = format!(
+            "--BOUND\r\nContent-Type: {ct}; name=\"{f}\"\r\nContent-Disposition: attachment; filename=\"{f}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b}\r\n",
+            f = filename,
+            ct = content_type,
+            b = base64
+        );
+        let marker = "--BOUND--\r\n";
+        assert!(self.body.ends_with(marker), "message must already be multipart");
+        self.body = format!(
+            "{}{}{}",
+            &self.body[..self.body.len() - marker.len()],
+            part,
+            marker
+        );
+        self.attachment = Some(filename.into());
+        self
+    }
+    /// body can reference it via a `cid:` URL (embedded/inline image).
+    pub fn with_embedded_image(mut self, filename: &str, content_type: &str, base64: &str, cid: &str) -> Self {
+        self.body = format!(
+            "--BOUND\r\nContent-Type: text/html; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: 7bit\r\n\r\n{}\r\n--BOUND\r\nContent-Type: {ct}; name=\"{f}\"\r\nContent-ID: <{c}>\r\nContent-Disposition: inline; filename=\"{f}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b}\r\n--BOUND--\r\n",
+            self.body.replace('\n', "\r\n"),
+            f = filename,
+            ct = content_type,
+            b = base64,
+            c = cid
+        );
+        self.attachment = Some(filename.into());
+        self
+    }
+
     fn envelope(&self) -> String {
         // All 10 envelope fields; empty name must be NIL, not "".
         format!(

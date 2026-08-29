@@ -665,3 +665,49 @@ fn get_attachment_data_returns_decodable_base64() {
         assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
     });
 }
+
+#[test]
+fn fetch_attachment_parts_batch_fetches_all_in_one_roundtrip() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let msg = FakeMessage::new(1, "Two pics", "a@b.com", 1, false)
+            .with_image_attachment("one.png", "image/png", "iVBORw0KGgo=")
+            .add_image_attachment("two.jpg", "image/jpeg", "/9j/4AAQSkZJRg==");
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "BatchData");
+
+        let atts = crate::mail::attachment_meta(&acc, "INBOX", 1).expect("atts");
+        assert_eq!(atts.len(), 2);
+        let indexes: Vec<usize> = atts.iter().map(|a| a.part_id.parse().unwrap()).collect();
+        let datas = block_on(async {
+            let acc = acc.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::mail::fetch_attachment_parts(&acc, "INBOX", 1, &indexes)
+            })
+            .await
+        })
+        .expect("join")
+        .expect("data");
+        assert_eq!(datas.len(), 2);
+        assert_eq!(datas[0], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(datas[1], b"\xff\xd8\xff\xe0\x00\x10JFIF");
+    });
+}
+
+#[test]
+fn embedded_image_reports_content_id() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        let msg = FakeMessage::new(1, "Embedded pic", "a@b.com", 1, false)
+            .with_embedded_image("logo.png", "image/png", "iVBORw0KGgo=", "logo123@example.com");
+        state.add_message("INBOX", msg);
+        let acc = test_account(&state, "CidAtt");
+
+        let atts = crate::mail::attachment_meta(&acc, "INBOX", 1).expect("atts");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].filename, "logo.png");
+        assert_eq!(atts[0].content_type, "image/png");
+        // Angle brackets are stripped from the header value.
+        assert_eq!(atts[0].content_id.as_deref(), Some("logo123@example.com"));
+    });
+}

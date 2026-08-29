@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { renderViewSubject, renderViewMeta, renderViewBody } from "./mailview.js";
+import {
+  renderViewSubject,
+  renderViewMeta,
+  renderViewBody,
+  rewriteCidImages,
+} from "./mailview.js";
 
 function mockView() {
   return {
@@ -8,6 +13,40 @@ function mockView() {
     frame: { srcdoc: "" },
   };
 }
+
+describe("rewriteCidImages", () => {
+  it("replaces double-quoted src cid references with data URLs", () => {
+    const map = new Map([["logo@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages('<img src="cid:logo@x">', map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+  });
+  it("handles single-quoted and unquoted src", () => {
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages("<img src='cid:a@x'>", map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+    expect(rewriteCidImages("src=cid:a@x", map)).toBe(
+      'src="data:image/png;base64,AAA"'
+    );
+  });
+  it("leaves references without matching data untouched", () => {
+    const html = '<img src="cid:nope@x">';
+    expect(rewriteCidImages(html, new Map())).toBe(html);
+  });
+  it("rewrites url(cid:...) in inline styles", () => {
+    const map = new Map([["bg@x", "data:image/gif;base64,BBB"]]);
+    expect(rewriteCidImages("background:url(cid:bg@x)", map)).toBe(
+      'background:url("data:image/gif;base64,BBB")'
+    );
+  });
+  it("matches cid tokens with angle brackets", () => {
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages('<img src="cid:<a@x>">', map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+  });
+});
 
 describe("renderViewSubject", () => {
   it("shows the subject", () => {

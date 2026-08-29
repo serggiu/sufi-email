@@ -29,6 +29,10 @@ pub struct AttachmentMeta {
     pub size: i64,
     /// IMAP body part number, used to fetch this part on "Save as".
     pub part_id: String,
+    /// Content-ID (without angle brackets) when the part is embedded in the
+    /// message body via a `cid:` URL. None for plain attachments.
+    #[serde(rename = "contentId")]
+    pub content_id: Option<String>,
 }
 
 impl Store {
@@ -112,7 +116,19 @@ impl Store {
                  part_id   TEXT    NOT NULL,
                  filename  TEXT,
                  mime      TEXT,
-                 size      INTEGER
+                 size      INTEGER,
+                 content_id TEXT
+             );
+             -- Decoded attachment bytes, cached on demand so inline image
+             -- previews don't re-download the whole message on every view
+             -- and keep working offline after the first view. Kept in a
+             -- separate table so body warm-up (which rewrites attachment
+             -- metadata) never wipes cached data.
+             CREATE TABLE IF NOT EXISTS attachment_data (
+                 msg_row  INTEGER NOT NULL REFERENCES messages(rowid_pk) ON DELETE CASCADE,
+                 part_id  TEXT    NOT NULL,
+                 data     BLOB    NOT NULL,
+                 PRIMARY KEY (msg_row, part_id)
              );
              -- UIDs we have already notified the user about (new-mail
              -- notifications), one row per message. Shared by the
@@ -164,6 +180,10 @@ impl Store {
         );
         let _ = conn.execute_batch(
             "ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';",
+        );
+        // Attachment metadata content-id column (embedded image support).
+        let _ = conn.execute_batch(
+            "ALTER TABLE attachments ADD COLUMN content_id TEXT;",
         );
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_folder_thread ON messages(folder, thread_id);",
@@ -303,12 +323,16 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             for a in attachments {
                 tx.execute(
-                    "INSERT INTO attachments (msg_row, part_id, filename, mime, size)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![row, a.part_id, a.filename, a.content_type, a.size],
+                    "INSERT INTO attachments (msg_row, part_id, filename, mime, size, content_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![row, a.part_id, a.filename, a.content_type, a.size, a.content_id],
                 )
                 .map_err(|e| e.to_string())?;
             }
+            // Drop cached bytes for parts that no longer exist (the message
+            // changed since the data was cached).
+            let ids: Vec<String> = attachments.iter().map(|a| a.part_id.clone()).collect();
+            prune_attachment_data(&tx, row, &ids)?;
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -397,12 +421,15 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 for a in &b.attachments {
                     tx.execute(
-                        "INSERT INTO attachments (msg_row, part_id, filename, mime, size)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![row, a.part_id, a.filename, a.content_type, a.size],
+                        "INSERT INTO attachments (msg_row, part_id, filename, mime, size, content_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![row, a.part_id, a.filename, a.content_type, a.size, a.content_id],
                     )
                     .map_err(|e| e.to_string())?;
                 }
+                // Drop cached bytes for parts that no longer exist.
+                let ids: Vec<String> = b.attachments.iter().map(|a| a.part_id.clone()).collect();
+                prune_attachment_data(&tx, row, &ids)?;
             }
         }
         tx.commit().map_err(|e| e.to_string())
@@ -440,7 +467,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT a.filename, a.mime, COALESCE(a.size,0), a.part_id
+                "SELECT a.filename, a.mime, COALESCE(a.size,0), a.part_id, a.content_id
                  FROM attachments a JOIN messages m ON m.rowid_pk = a.msg_row
                  WHERE m.folder = ?1 AND m.uid = ?2",
             )
@@ -452,10 +479,139 @@ impl Store {
                     content_type: r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "application/octet-stream".into()),
                     size: r.get(2)?,
                     part_id: r.get(3)?,
+                    content_id: r.get(4)?,
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Cached decoded bytes for one attachment part; None when we haven't
+    /// fetched it yet (or the message has no such part).
+    pub fn load_attachment_data(
+        &self,
+        folder: &str,
+        uid: u32,
+        part_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .query_row(
+                "SELECT d.data FROM attachment_data d
+                 JOIN messages m ON m.rowid_pk = d.msg_row
+                 WHERE m.folder = ?1 AND m.uid = ?2 AND d.part_id = ?3",
+                rusqlite::params![folder, uid, part_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other.to_string()),
+            })
+    }
+
+    /// Cached decoded bytes for several parts of one message, aligned with
+    /// `part_ids` (None where a part isn't cached yet).
+    pub fn load_attachments_data(
+        &self,
+        folder: &str,
+        uid: u32,
+        part_ids: &[String],
+    ) -> Result<Vec<Option<Vec<u8>>>, String> {
+        if part_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = part_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT d.part_id, d.data FROM attachment_data d
+             JOIN messages m ON m.rowid_pk = d.msg_row
+             WHERE m.folder = ?1 AND m.uid = ?2 AND d.part_id IN ({placeholders})"
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(folder.to_string()), Box::new(uid as i64)];
+        for p in part_ids {
+            params.push(Box::new(p.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let found: std::collections::HashMap<String, Vec<u8>> = rows
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(part_ids.iter().map(|p| found.get(p).cloned()).collect())
+    }
+
+    /// Cache decoded bytes for one attachment part (upsert).
+    pub fn store_attachment_data(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        part_id: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rowid_pk FROM messages WHERE folder = ?1 AND uid = ?2",
+                rusqlite::params![folder, uid as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(row) = row {
+            self.conn
+                .execute(
+                    "INSERT INTO attachment_data (msg_row, part_id, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(msg_row, part_id) DO UPDATE SET data = excluded.data",
+                    rusqlite::params![row, part_id, data],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Cache decoded bytes for several parts of one message (single
+    /// transaction).
+    pub fn store_attachments_data(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        parts: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rowid_pk FROM messages WHERE folder = ?1 AND uid = ?2",
+                rusqlite::params![folder, uid as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(row) = row else {
+            return Ok(()); // Message not in cache; nothing to attach data to.
+        };
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO attachment_data (msg_row, part_id, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(msg_row, part_id) DO UPDATE SET data = excluded.data",
+                )
+                .map_err(|e| e.to_string())?;
+            for (part_id, data) in parts {
+                stmt.execute(rusqlite::params![row, part_id, data])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     /// Remove a message from the local cache (after move/delete on server).
@@ -1006,6 +1162,32 @@ pub fn extract_attachments(raw: &[u8]) -> Vec<AttachmentMeta> {
     }
 }
 
+/// Drop cached attachment bytes whose part no longer exists on the message
+/// (the message was updated on the server since the data was cached).
+fn prune_attachment_data(
+    tx: &rusqlite::Transaction<'_>,
+    msg_row: i64,
+    keep: &[String],
+) -> Result<(), String> {
+    if keep.is_empty() {
+        tx.execute("DELETE FROM attachment_data WHERE msg_row = ?1", [msg_row])
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let placeholders = keep.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "DELETE FROM attachment_data WHERE msg_row = ?1 AND part_id NOT IN ({placeholders})"
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(msg_row)];
+    for p in keep {
+        params.push(Box::new(p.clone()));
+    }
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    tx.execute(&sql, param_refs.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Attachment metadata from an already-parsed message (used by the message
 /// stream, which parses the raw message for snippets anyway).
 pub(crate) fn extract_attachments_from(msg: &mail_parser::Message) -> Vec<AttachmentMeta> {
@@ -1030,6 +1212,9 @@ pub(crate) fn extract_attachments_from(msg: &mail_parser::Message) -> Vec<Attach
             // Position in the attachments iterator; used to locate the
             // part again when the user asks to save it.
             part_id: i.to_string(),
+            content_id: part
+                .content_id()
+                .map(|c| c.trim().trim_start_matches('<').trim_end_matches('>').to_string()),
         });
     }
     out

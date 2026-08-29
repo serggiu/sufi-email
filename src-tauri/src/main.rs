@@ -501,6 +501,8 @@ struct AttachmentInfo {
     content_type: String,
     size: i64,
     part_id: String,
+    #[serde(rename = "contentId")]
+    content_id: Option<String>,
 }
 
 #[tauri::command]
@@ -524,6 +526,7 @@ async fn list_attachments(
             content_type: a.content_type,
             size: a.size,
             part_id: a.part_id,
+            content_id: a.content_id,
         })
         .collect())
 }
@@ -580,30 +583,59 @@ async fn get_thread(
     store.load_thread(&folder, &thread_id)
 }
 
-/// Fetch one attachment part and return it base64-encoded, for inline image
-/// thumbnails in the message view.
+/// Fetch attachment parts and return them base64-encoded, for inline image
+/// thumbnails and cid: rewriting in the message view. All requested parts of
+/// one message are fetched with a single round-trip, and each part is cached
+/// on first use so later views (and offline views) don't hit the server.
 #[tauri::command]
-async fn get_attachment_data(
+async fn get_attachments_data(
     account: String,
     folder: String,
     uid: u32,
-    part_id: String,
+    part_ids: Vec<String>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let cfg = {
         let c = state.config.lock().unwrap();
         c.accounts.iter().find(|a| a.name == account).cloned()
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
-    let part_index: usize = part_id.parse().map_err(|_| "invalid part id")?;
-    let acc2 = acc.clone();
-    let folder2 = folder.clone();
-    let data = tauri::async_runtime::spawn_blocking(move || {
-        mail::fetch_attachment_part(&acc2, &folder2, uid, part_index)
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))??;
-    Ok(crypto::base64_encode(&data))
+    let part_indexes: Vec<usize> = part_ids
+        .iter()
+        .map(|p| p.parse().map_err(|_| format!("invalid part id '{p}'")))
+        .collect::<Result<_, _>>()?;
+
+    // Serve everything we already have from the local cache.
+    let mut store = store::Store::open(&acc)?;
+    let mut cached = store.load_attachments_data(&folder, uid, &part_ids)?;
+
+    // One round-trip for every part we're still missing.
+    let miss_indexes: Vec<usize> = cached
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| if c.is_none() { Some(i) } else { None })
+        .collect();
+    if !miss_indexes.is_empty() {
+        let miss_positions: Vec<usize> = miss_indexes.iter().map(|&i| part_indexes[i]).collect();
+        let acc2 = acc.clone();
+        let folder2 = folder.clone();
+        let fetched = tauri::async_runtime::spawn_blocking(move || {
+            mail::fetch_attachment_parts(&acc2, &folder2, uid, &miss_positions)
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))??;
+        let mut to_cache = Vec::with_capacity(fetched.len());
+        for (k, data) in fetched.into_iter().enumerate() {
+            cached[miss_indexes[k]] = Some(data.clone());
+            to_cache.push((part_ids[miss_indexes[k]].clone(), data));
+        }
+        store.store_attachments_data(&folder, uid, &to_cache)?;
+    }
+
+    Ok(cached
+        .into_iter()
+        .map(|c| c.map(|d| crypto::base64_encode(&d)).unwrap_or_default())
+        .collect())
 }
 
 /// Fetch one attachment part by its position in the attachments iterator
@@ -626,7 +658,17 @@ async fn save_attachment(
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
     let part_index: usize = part_id.parse().map_err(|_| "invalid part id")?;
 
-    // Fetch + extract the requested part off the UI thread.
+    // Prefer the cached copy (already fetched for a thumbnail preview) so
+    // saving doesn't re-download the whole message.
+    let mut store = store::Store::open(&acc)?;
+    if let Some(data) = store.load_attachment_data(&folder, uid, &part_id)? {
+        let mut file = open_private_file(&dest_path)
+            .map_err(|e| format!("create {}: {e}", dest_path))?;
+        file.write_all(&data).map_err(|e| format!("write: {e}"))?;
+        return Ok(());
+    }
+
+    // Not cached: fetch + extract the requested part off the UI thread.
     let acc2 = acc.clone();
     let folder2 = folder.clone();
     let data = tauri::async_runtime::spawn_blocking(move || {
@@ -634,6 +676,7 @@ async fn save_attachment(
     })
     .await
     .map_err(|e| format!("join error: {e}"))??;
+    store.store_attachment_data(&folder, uid, &part_id, &data)?;
 
     let mut file = open_private_file(&dest_path)
         .map_err(|e| format!("create {}: {e}", dest_path))?;
@@ -992,7 +1035,7 @@ fn main() {
             delete_message_local,
             delete_message_server,
             get_thread,
-            get_attachment_data,
+            get_attachments_data,
             send_email
         ])
         .run(tauri::generate_context!())
