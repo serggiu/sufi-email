@@ -874,6 +874,8 @@ pub async fn set_seen(
 /// which is the standard IMAP move pattern.
 /// Fetch the Message-IDs of the given UIDs in one round-trip (used by the
 /// IDLE watcher to tell moved messages apart from genuinely new mail).
+/// Results are aligned by UID, not by response position — servers may
+/// return FETCH responses in any order.
 pub fn fetch_message_ids(
     session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
     uids: &[u32],
@@ -889,14 +891,17 @@ pub fn fetch_message_ids(
     let fetches = session
         .uid_fetch(set, "(BODY.PEEK[HEADER])")
         .map_err(|e| format!("FETCH failed: {e}"))?;
-    Ok(fetches
-        .iter()
-        .map(|f| {
-            f.header()
-                .and_then(|h| MessageParser::default().parse_headers(h))
-                .and_then(|m| m.message_id().map(|s| s.to_string()))
-        })
-        .collect())
+    let mut by_uid: std::collections::HashMap<u32, Option<String>> =
+        std::collections::HashMap::new();
+    for f in fetches.iter() {
+        let uid = f.uid.unwrap_or(0);
+        let mid = f
+            .header()
+            .and_then(|h| MessageParser::default().parse_headers(h))
+            .and_then(|m| m.message_id().map(|s| s.to_string()));
+        by_uid.insert(uid, mid);
+    }
+    Ok(uids.iter().map(|u| by_uid.get(u).cloned().flatten()).collect())
 }
 
 /// Move a message to another folder (COPY + \Deleted + expunge). Returns

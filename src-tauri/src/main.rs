@@ -218,10 +218,12 @@ async fn list_folders(
                 Err(e)
             }
         };
-        let _ = on_refresh.send(match result {
+        if let Err(e) = on_refresh.send(match result {
             Ok(fresh) => (fresh, true),
             Err(_) => (Vec::new(), false),
-        });
+        }) {
+            log::warn!("folder refresh channel send failed: {e}");
+        }
     });
 
     Ok(cached)
@@ -833,7 +835,11 @@ fn filter_moved_new_uids(
     if new_uids.is_empty() {
         return new_uids;
     }
-    let ids = match mail::fetch_message_ids(session, &new_uids) {
+    // Keep the fetch list sorted so the batched header fetch is compact;
+    // fetch_message_ids aligns results by UID, so order never matters.
+    let mut sorted = new_uids.clone();
+    sorted.sort_unstable();
+    let ids = match mail::fetch_message_ids(session, &sorted) {
         Ok(ids) => ids,
         Err(e) => {
             log::warn!("new-mail header fetch failed: {e}; notifying as new");
@@ -843,12 +849,12 @@ fn filter_moved_new_uids(
     let Ok(mut store) = store::Store::open(acc) else {
         return new_uids;
     };
-    let (genuine, moved) = partition_genuine_vs_moved(&new_uids, &ids, &|mid| {
+    let (genuine, moved) = partition_genuine_vs_moved(&sorted, &ids, &|mid| {
         store.message_id_known(mid).unwrap_or(false)
     });
     if !moved.is_empty() {
         log::info!(
-            "{} message(s) moved into {inbox} (not new mail), no toast",
+            "{} message(s) in {inbox} already known in the cache (moved or previously synced), no toast",
             moved.len()
         );
         let _ = store.mark_notified(inbox, &moved);
@@ -1013,6 +1019,14 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
     flush_pending_flags(app);
     log::info!("background watcher for {} watching {inbox} (IDLE)", acc.email);
 
+    // Catch up on anything that arrived while the connection was down:
+    // IDLE only pushes FUTURE changes, so without this diff a message that
+    // landed during a disconnect would stay invisible until a manual
+    // refresh. Best-effort: a failed catch-up must not abort the watch.
+    if let Err(e) = process_inbox_change(app, acc, &inbox, &mut session) {
+        log::warn!("inbox catch-up after reconnect failed: {e}");
+    }
+
     loop {
         use imap::extensions::idle::WaitOutcome;
         // Bind the outcome first so the temporary IDLE handle (which borrows
@@ -1023,41 +1037,9 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
                 // The server pushed a mailbox change — most likely new mail.
                 // Reuse this session (the IDLE borrow has ended) to diff the
                 // UIDs and react instantly.
-                let uids = match session.uid_search("ALL") {
-                    Ok(ids) => {
-                        let mut v: Vec<u32> = ids.into_iter().collect();
-                        v.sort_unstable();
-                        v
-                    }
-                    Err(e) => {
-                        log::warn!("UID SEARCH after IDLE failed: {e}");
-                        continue;
-                    }
-                };
-                let new = diff_new_uids(acc, &inbox, &uids);
-                // A message moved into Inbox from another folder (by any
-                // client) shows up as a brand-new UID here; drop those
-                // whose Message-ID is already cached so they don't toast.
-                let new = filter_moved_new_uids(acc, &inbox, &mut session, new);
-                if !new.is_empty() {
-                    log::info!(
-                        "new mail: {} message(s) for {} ({inbox})",
-                        new.len(),
-                        acc.email
-                    );
-                    // Sender + subject from the ENVELOPE on this very
-                    // session — instant, no full sync needed.
-                    let newest = *new.iter().max().unwrap_or(&0);
-                    let (from, subject) =
-                        mail::fetch_envelope_preview(&mut session, newest).unwrap_or_default();
-                    fire_new_mail_notification(&from, &subject, new.len() - 1);
-                    // Warm the INBOX cache so the message is already in the
-                    // list when the user opens/refreshes it — the toast
-                    // should not beat the message.
-                    warm_inbox_cache(acc, &inbox);
+                if let Err(e) = process_inbox_change(app, acc, &inbox, &mut session) {
+                    log::warn!("inbox change handling failed: {e}");
                 }
-                flush_pending_flags(app);
-                let _ = app.emit("mail-refresh", ());
                 // Re-enter IDLE.
             }
             Ok(WaitOutcome::TimedOut) => {
@@ -1066,6 +1048,47 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
             Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+/// One mailbox-change pass: diff the current UID set, drop moved messages,
+/// notify about genuinely new mail, warm the cache, and poke the frontend.
+/// Shared by the IDLE push handler and the post-reconnect catch-up.
+fn process_inbox_change(
+    app: &tauri::AppHandle,
+    acc: &AccountConfig,
+    inbox: &str,
+    session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
+) -> Result<(), String> {
+    let uids = session
+        .uid_search("ALL")
+        .map_err(|e| format!("UID SEARCH failed: {e}"))?;
+    let mut uids: Vec<u32> = uids.into_iter().collect();
+    uids.sort_unstable();
+    let new = diff_new_uids(acc, inbox, &uids);
+    // A message moved into Inbox from another folder (by any client) shows
+    // up as a brand-new UID here; drop those whose Message-ID is already
+    // cached so they don't toast.
+    let new = filter_moved_new_uids(acc, inbox, session, new);
+    if !new.is_empty() {
+        log::info!(
+            "new mail: {} message(s) for {} ({inbox})",
+            new.len(),
+            acc.email
+        );
+        // Sender + subject from the ENVELOPE on this very session —
+        // instant, no full sync needed.
+        let newest = *new.iter().max().unwrap_or(&0);
+        let (from, subject) =
+            mail::fetch_envelope_preview(session, newest).unwrap_or_default();
+        fire_new_mail_notification(&from, &subject, new.len() - 1);
+        // Warm the INBOX cache so the message is already in the list when
+        // the user opens/refreshes it — the toast should not beat the
+        // message.
+        warm_inbox_cache(acc, inbox);
+    }
+    flush_pending_flags(app);
+    let _ = app.emit("mail-refresh", ());
+    Ok(())
 }
 
 /// The configured auto-refresh interval in minutes (0 = off).

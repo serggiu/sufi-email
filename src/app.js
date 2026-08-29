@@ -46,14 +46,31 @@ function guardTauri() {
 
 /* ---------- folders ---------- */
 
+// Applies a fresh folder list from a completed server refresh. Channels in
+// Tauri v2 are tied to a per-invoke Rust-side counter, so a JS Channel must
+// be created per invoke (see loadFolders/probeConnectivity) — a shared
+// module-level channel collides on the message index and drops every
+// refresh after the first.
+function applyFolderRefresh(folders, online) {
+  setOnlineStatus(online);
+  if (folders.length > 0) {
+    state.folders = folders;
+    renderFolders();
+  }
+}
+
 async function loadFolders() {
   if (!state.account) return;
+  // Fresh channel per invoke: a shared channel drops refreshes after the
+  // first (per-invoke Rust-side message counters collide on the JS side).
+  const channel = new window.__TAURI__.core.Channel();
+  channel.onmessage = ([folders, online]) => applyFolderRefresh(folders, online);
   try {
     // Returns the cached list immediately; the server refresh arrives later
     // on the channel (or never, if offline).
     const cached = await invoke("list_folders", {
       account: state.account.name,
-      onRefresh: folderRefreshChannel,
+      onRefresh: channel,
     });
     if (cached.length > 0) {
       state.folders = cached;
@@ -76,16 +93,6 @@ async function loadFolders() {
     showStatus(String(e));
   }
 }
-
-// Receives (folders, online) when the background server refresh completes.
-const folderRefreshChannel = new window.__TAURI__.core.Channel();
-folderRefreshChannel.onmessage = ([folders, online]) => {
-  if (folders.length > 0) {
-    state.folders = folders;
-    renderFolders();
-  }
-  setOnlineStatus(online);
-};
 
 function setOnlineStatus(online) {
   const wasOffline = state.online === false;
@@ -121,13 +128,7 @@ let offlineTimer = null;
 async function probeConnectivity() {
   if (!state.account) return;
   const channel = new window.__TAURI__.core.Channel();
-  channel.onmessage = ([folders, online]) => {
-    if (folders.length > 0) {
-      state.folders = folders;
-      renderFolders();
-    }
-    setOnlineStatus(online);
-  };
+  channel.onmessage = ([folders, online]) => applyFolderRefresh(folders, online);
   try {
     const cached = await invoke("list_folders", {
       account: state.account.name,
