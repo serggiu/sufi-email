@@ -18,9 +18,112 @@ mod store_tests;
 use account::{AccountConfig, AccountInfo, Config};
 use std::sync::Mutex;
 use std::time::Duration;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
+
+/// Envelope icons for the system tray: grey when there are no unread
+/// messages (fits neutral menubar themes), blue when mail is waiting.
+const TRAY_ICON_GRAY: &[u8] = include_bytes!("../icons/tray-gray.png");
+const TRAY_ICON_BLUE: &[u8] = include_bytes!("../icons/tray-blue.png");
+
+fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
+    let bytes = if unread > 0 {
+        TRAY_ICON_BLUE
+    } else {
+        TRAY_ICON_GRAY
+    };
+    tauri::image::Image::from_bytes(bytes).expect("embedded tray icon")
+}
+
+/// Sum of unread messages across every configured account (from the cache).
+fn total_unread(app: &tauri::AppHandle) -> u32 {
+    let cfg = { app.state::<AppState>().config.lock().unwrap().clone() };
+    cfg.accounts
+        .iter()
+        .filter_map(|acc| {
+            store::Store::open(acc)
+                .ok()
+                .and_then(|s| s.load_folders().ok())
+                .map(|folders| folders.iter().map(|f| f.unread).sum::<u32>())
+        })
+        .sum()
+}
+
+/// Tooltip shown on the tray icon (the StatusNotifierItem Title, which the
+/// tray host displays).
+fn tray_tooltip(unread: u32) -> String {
+    match unread {
+        0 => "Sufi Email - no new messages".to_string(),
+        1 => "Sufi Email - 1 new message".to_string(),
+        n => format!("Sufi Email - {n} new messages"),
+    }
+}
+
+/// Set the tray icon (grey envelope with no unread mail, blue otherwise)
+/// and its tooltip, which follows the unread count. Both the StatusNotifierItem
+/// Title and ToolTip are updated (the vendored tray-icon patches make
+/// set_title/set_tooltip work on Linux); tray hosts like omarchy prefer the
+/// ToolTip.
+fn update_tray_icon(app: &tauri::AppHandle) {
+    let unread = total_unread(app);
+    let tooltip = tray_tooltip(unread);
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(Some(tooltip.clone()));
+        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_icon(Some(tray_icon(unread)));
+    }
+}
+
+/// Create the tray icon with its menu, and wire "Show Email" / "Quit".
+/// Note: on Linux the tray backend (libappindicator) does not deliver icon
+/// click events — the host shows the menu on click, so "Show Email" is the
+/// reliable way to open the window there. The left-click handler covers
+/// platforms/hosts that do report clicks.
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Email", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let tray = TrayIconBuilder::with_id("main-tray")
+        .icon(tray_icon(total_unread(app)))
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    // The Linux backend ignores set_tooltip; the host shows the StatusNotifier
+    // title instead, so set both.
+    let _ = tray.set_tooltip(Some("Sufi Email"));
+    let _ = tray.set_title(Some("Sufi Email"));
+    Ok(())
+}
+
+/// Show and focus the main window (used by the tray's left-click and the
+/// "Show Email" menu item).
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 
 pub struct AppState {
     pub config: Mutex<Config>,
@@ -207,6 +310,9 @@ async fn list_folders(
                 if let Ok(mut store) = store::Store::open(&acc2) {
                     let _ = store.store_folders(&fresh);
                 }
+                // Tray icon follows unread mail (blue when anything is
+                // unread, grey otherwise).
+                update_tray_icon(&app2);
                 // A successful round trip proves we are online — push any
                 // offline read/unread changes to the server.
                 let app3 = app2.clone();
@@ -1177,6 +1283,12 @@ fn process_inbox_change(
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();    let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
+    // The system tray's StatusNotifierItem Title comes from the glib
+    // application name (libappindicator reads g_get_application_name()), and
+    // the tray host shows that as the tooltip — set it before the tray is
+    // built so the initial hover text is right; update_tray_icon refreshes
+    // it with the unread count afterwards.
+    glib::set_application_name("Sufi Email");
 
     // Backfill content hashes + remove duplicates in existing caches.
     for acc in &config.accounts {
@@ -1203,7 +1315,18 @@ fn main() {
         })
         .setup(|app| {
             spawn_missing_idle_watchers(app.handle());
+            setup_tray(app.handle())?;
+            update_tray_icon(app.handle());
             Ok(())
+        })
+        // Close-to-tray: clicking the window's close button (or Super+W)
+        // only hides the window; the app keeps running in the background
+        // with the tray icon. Quit from the tray menu is the real exit.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_accounts,

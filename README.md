@@ -25,6 +25,9 @@ standard IMAP/SMTP accounts, fetches mail, and sends messages.
 - **Optimistic UI**: delete and move apply instantly with no flash-back, the
   message lands in Trash/the destination right away, and failures roll back
   on the next sync
+- **System tray**: an envelope icon shows unread mail (grey with no
+  unread, blue when mail is waiting, tooltip with the count); closing the
+  window hides it to the tray, Quit from the tray menu is the real exit
 - **Multiple accounts**, added and switched from the UI; connections are
   tested before an account is saved
 - Config-driven accounts (`config.toml`), passwords sealed with a
