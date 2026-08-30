@@ -7,7 +7,12 @@ import {
   cidTokensInHtml,
   planAttachmentDisplay,
   cidDataMap,
+  frameDisplayHeight,
+  frameAvailableHeight,
+  frameContentHeight,
+  EMAIL_FRAME_SANDBOX,
 } from "./mailview.js";
+import { withEmailCsp } from "./format.js";
 
 function mockView() {
   return {
@@ -198,14 +203,107 @@ describe("renderViewBody", () => {
   it("escapes plain-text bodies into a <pre>", async () => {
     const view = mockView();
     await renderViewBody(view, { text: "<script>alert(1)</script>" });
-    // The email's script is escaped (inert); the only real <script> in the
-    // document is the app's own link handler.
+    // The email's script is escaped to inert text — no real <script>
+    // element exists in the sandboxed document (scripts are forbidden by
+    // its CSP and the sandbox itself).
     expect(view.frame.srcdoc).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     expect(view.frame.srcdoc).not.toContain(">alert(1)<");
+    expect(view.frame.srcdoc).not.toContain("<script");
   });
   it("shows an empty-message placeholder", async () => {
     const view = mockView();
     await renderViewBody(view, {});
     expect(view.frame.srcdoc).toContain("(empty message)");
+  });
+});
+
+describe("frameDisplayHeight", () => {
+  it("fills the entire available height for content shorter than the pane", () => {
+    // A short message must use the whole reading area, not sit in a
+    // fixed-height box at the top.
+    expect(frameDisplayHeight(200, 800)).toBe(800);
+  });
+
+  it("keeps the full content height when it exceeds the pane (no nested scrollbar)", () => {
+    // Regression: the iframe must never be shorter than its content, or a
+    // scrollbar appears INSIDE the message body and the outer container
+    // scrolls too — the "fixed height window" the user reported.
+    expect(frameDisplayHeight(5000, 800)).toBe(5000);
+    expect(frameDisplayHeight(900, 800)).toBe(900);
+  });
+
+  it("matches the content height when content and available space agree", () => {
+    expect(frameDisplayHeight(800, 800)).toBe(800);
+  });
+
+  it("never falls below a small floor for empty content", () => {
+    expect(frameDisplayHeight(0, 0)).toBe(80);
+    expect(frameDisplayHeight(0, 600)).toBe(600);
+  });
+
+  it("uses the content height when the container reports no space yet", () => {
+    // The modal is opened before its thread renders, so frames can report
+    // while #modal-thread's client height is still 0 — the content height
+    // must win, not collapse to the floor.
+    expect(frameDisplayHeight(250, 0)).toBe(250);
+  });
+});
+
+describe("frameAvailableHeight", () => {
+  it("reads the height from the frame's scroll container", () => {
+    const frame = { closest: () => ({ clientHeight: 640 }) };
+    expect(frameAvailableHeight(frame)).toBe(640);
+  });
+
+  it("falls back to the window height when no container matches", () => {
+    const frame = { closest: () => null };
+    expect(frameAvailableHeight(frame)).toBe(window.innerHeight);
+  });
+});
+
+describe("email frame sandbox + parent-side measurement (reading-pane fix)", () => {
+  it("sizes the iframe from the parent via a same-origin sandbox", () => {
+    // Regression: the reading pane must fill the available height. The
+    // parent measures the message document directly, which requires the
+    // sandbox to grant allow-same-origin (the old in-iframe script never
+    // ran in the release webview, leaving messages in a fixed ~150px box).
+    expect(EMAIL_FRAME_SANDBOX).toContain("allow-same-origin");
+  });
+
+  it("still forbids scripts inside the email document", () => {
+    // No allow-scripts in the sandbox and no script allowance in the email
+    // CSP: the untrusted message stays script-free even though it shares
+    // the origin (so the parent can measure it).
+    expect(EMAIL_FRAME_SANDBOX).not.toContain("allow-scripts");
+    expect(withEmailCsp("<html><head></head><body>hi</body></html>")).toContain(
+      "script-src 'none'"
+    );
+  });
+
+  it("measures the message height from the taller of body/documentElement", () => {
+    const doc = {
+      body: { scrollHeight: 3639 },
+      documentElement: { scrollHeight: 3673 },
+    };
+    expect(frameContentHeight(doc)).toBe(3673);
+    expect(
+      frameContentHeight({ body: { scrollHeight: 500 }, documentElement: { scrollHeight: 400 } })
+    ).toBe(500);
+  });
+
+  it("reports 0 for an unreadable/empty document", () => {
+    expect(frameContentHeight(null)).toBe(0);
+    expect(frameContentHeight({})).toBe(0);
+  });
+
+  it("combines measurement + sizing: long content keeps full height, short fills the pane", () => {
+    const longDoc = { body: { scrollHeight: 3673 }, documentElement: { scrollHeight: 3673 } };
+    const shortDoc = { body: { scrollHeight: 150 }, documentElement: { scrollHeight: 150 } };
+    const available = 758;
+    // Tall message: the iframe keeps its full content height and the OUTER
+    // container scrolls — never a nested scrollbar inside the message.
+    expect(frameDisplayHeight(frameContentHeight(longDoc), available)).toBe(3673);
+    // Short message: fills the entire available reading height.
+    expect(frameDisplayHeight(frameContentHeight(shortDoc), available)).toBe(available);
   });
 });

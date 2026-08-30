@@ -12,6 +12,10 @@ import {
   rewriteCidImages,
   planAttachmentDisplay,
   cidDataMap,
+  frameDisplayHeight,
+  frameAvailableHeight,
+  frameContentHeight,
+  EMAIL_FRAME_SANDBOX,
 } from "./lib/mailview.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
@@ -773,7 +777,13 @@ async function renderThread(subjectEl, metaEl, container, thread) {
 
     const frame = document.createElement("iframe");
     frame.className = "thread-msg-frame";
-    frame.sandbox = "allow-scripts";
+    // Same-origin sandbox: scripts, forms, popups and navigation inside the
+    // email are all blocked (the sandbox AND the injected CSP forbid
+    // scripts), but the parent can read the document to size the frame and
+    // intercept link clicks — the in-iframe sizing script approach was
+    // unreliable in the release webview, so the host measures directly.
+    frame.sandbox = EMAIL_FRAME_SANDBOX;
+    initMessageFrame(frame);
     const attsBox = document.createElement("div");
     attsBox.className = "thread-msg-atts";
 
@@ -862,6 +872,11 @@ async function openThreadModal(thread) {
   if (!thread || !thread.length) return;
   modalThreadId = thread[0].thread_id || "";
   modalUid = thread[0].uid;
+  // Open the dialog BEFORE rendering the thread: each message iframe
+  // measures its available height from #modal-thread's client height, which
+  // is 0 while the dialog is still closed — frames would then collapse to
+  // their content height instead of filling the modal.
+  $("message-modal").showModal();
   try {
     await renderThread(
       $("modal-subject"),
@@ -869,12 +884,12 @@ async function openThreadModal(thread) {
       $("modal-thread"),
       thread
     );
-    $("message-modal").showModal();
     for (const m of thread) {
       if (!m.seen) setSeen(m.uid, true);
     }
   } catch (e) {
     showError(String(e));
+    closeMessageModal();
   }
 }
 
@@ -1325,37 +1340,110 @@ function refreshMail() {
 function initMailRefreshListener() {
   if (!window.__TAURI__ || !window.__TAURI__.event) return;
   window.__TAURI__.event.listen("mail-refresh", () => {
-    if (!state.online || !state.account) return;
-    loadFolders();
-    if (state.folder) loadMessages();
+    if (!state.account) return;
+    if (state.online) {
+      loadFolders();
+      if (state.folder) loadMessages();
+    } else {
+      // The backend only emits mail-refresh after a successful server
+      // round trip (new-mail detection, reconnect catch-up, slow poll,
+      // optimistic move/delete), so the event itself proves connectivity
+      // is back — flip online, which also triggers the recovery refresh
+      // (loadFolders + loadMessages) instead of dropping the event.
+      setOnlineStatus(true);
+    }
+  });
+  // The backend reports a lost IMAP connection (also on startup when the
+  // app begins offline): mark offline so the recovery poller starts. This
+  // is the reliable offline signal — the webview's window "offline" event
+  // is not dependable on Linux/WebKitGTK.
+  window.__TAURI__.event.listen("connection-lost", () => {
+    if (state.account) setOnlineStatus(false);
   });
 }
 
-// Links inside the sandboxed email iframes are intercepted by a nonce'd
-// script (see withEmailCsp) and forwarded here, so they open in the
-// system's default browser instead of being dead. Only http(s) URLs are
-// ever opened.
-function initExternalLinks() {
-  if (!window.__TAURI__ || !window.__TAURI__.opener) return;
-  window.addEventListener("message", (e) => {
-    if (!e.data) return;
-    // Auto-size an email body iframe to its content (reported by the
-    // hash-pinned script inside), so thread discussions use the full
-    // height instead of tiny fixed iframes.
-    if (e.data.type === "sufi-frame-size" && typeof e.data.height === "number") {
-      for (const f of document.querySelectorAll(".thread-msg-frame")) {
-        if (f.contentWindow === e.source) {
-          f.style.height = Math.max(80, Math.min(e.data.height, 3000)) + "px";
-          break;
-        }
+// Wire a freshly created email-body iframe: measure its content from the
+// parent (the frame is sandboxed same-origin so its document is readable)
+// once it loads, keep the measurement current via a ResizeObserver, and
+// forward http(s) link clicks to the system browser.
+function initMessageFrame(frame) {
+  frame.addEventListener(
+    "load",
+    () => {
+      sizeFrameFromParent(frame);
+      attachFrameLinkHandler(frame);
+    },
+    { once: true }
+  );
+}
+
+// Size the iframe from its own document: the content height it reports via
+// scrollHeight (never shorter than the pane, so no nested scrollbar — the
+// outer container scrolls long content), re-measured whenever the email's
+// content changes (e.g. data: images decoding late).
+function sizeFrameFromParent(frame) {
+  const doc = frame.contentDocument;
+  if (!doc) return;
+  const content = frameContentHeight(doc);
+  if (content <= 0) return;
+  frame.dataset.contentHeight = String(content);
+  frame.style.height =
+    frameDisplayHeight(content, frameAvailableHeight(frame)) + "px";
+  if (!frame.__sufiObserved && typeof ResizeObserver !== "undefined") {
+    frame.__sufiObserved = true;
+    try {
+      new ResizeObserver(() => sizeFrameFromParent(frame)).observe(doc.body);
+    } catch (_) {}
+  }
+}
+
+// Intercept clicks on http(s) links inside the email (the email document
+// cannot run scripts — sandbox + CSP — so this is the only handler) and
+// open them in the system browser instead of navigating the iframe.
+function attachFrameLinkHandler(frame) {
+  const doc = frame.contentDocument;
+  if (!doc || doc.__sufiLinks) return;
+  doc.__sufiLinks = true;
+  doc.addEventListener(
+    "click",
+    (e) => {
+      const t = e.target;
+      const a = t && t.closest ? t.closest("a[href]") : null;
+      if (!a || e.defaultPrevented || e.button !== 0) return;
+      const href = a.href || "";
+      if (!/^https?:\/\//i.test(href)) return;
+      e.preventDefault();
+      if (window.__TAURI__ && window.__TAURI__.opener) {
+        window.__TAURI__.opener
+          .openUrl(href)
+          .catch((err) => showError(String(err)));
       }
-      return;
+    },
+    true
+  );
+}
+
+// Auto-size every email-body iframe from the parent: content shorter than
+// the pane fills the entire available height; content taller than it keeps
+// its full height so the OUTER container (preview pane / modal thread)
+// scrolls — never a nested scrollbar inside the message body. The
+// available height is re-clamped on window resize so short messages track
+// the pane.
+function initFrameSizing() {
+  window.addEventListener("resize", clampFrameHeights);
+}
+
+// Re-clamp every rendered message frame to the current available height
+// (short messages track the pane size, long ones keep their full content
+// height). Uses the content height each iframe last reported.
+function clampFrameHeights() {
+  for (const f of document.querySelectorAll(".thread-msg-frame")) {
+    const content = Number(f.dataset.contentHeight) || 0;
+    if (content > 0) {
+      f.style.height =
+        frameDisplayHeight(content, frameAvailableHeight(f)) + "px";
     }
-    if (e.data.type !== "sufi-open-url") return;
-    const url = e.data.url;
-    if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return;
-    window.__TAURI__.opener.openUrl(url).catch((err) => showError(String(err)));
-  });
+  }
 }
 
 function init() {
@@ -1372,7 +1460,7 @@ function init() {
   $("refresh-btn").addEventListener("click", refreshMail);
 
   initMailRefreshListener();
-  initExternalLinks();
+  initFrameSizing();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   $("compose-attach").addEventListener("click", attachFiles);
   document.getElementById("compose-form").addEventListener("submit", sendCompose);

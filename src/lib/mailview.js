@@ -128,3 +128,48 @@ export async function renderViewBody(view, body) {
     )}</pre>`;
   view.frame.srcdoc = await withEmailCsp(content);
 }
+
+// The sandbox flags for the email-body iframe: same-origin ONLY, so the
+// host can read the message document to size the frame and intercept link
+// clicks. Scripts, forms, popups and navigation stay blocked — by the
+// sandbox (no allow-scripts) AND by the injected CSP (script-src 'none').
+//
+// Regression guard for the reading-pane fix: sizing depends on the parent
+// being able to read the frame's document, which requires allow-same-origin.
+// The previous approach (allow-scripts + a script inside the email posting
+// its height) never ran in the release webview, leaving every message in a
+// fixed ~150px box.
+export const EMAIL_FRAME_SANDBOX = "allow-same-origin";
+
+// The content height of an email document, measured from the parent: the
+// taller of the body and documentElement scroll heights. 0 when the
+// document is not (yet) readable.
+export function frameContentHeight(doc) {
+  return Math.max(
+    doc && doc.body ? doc.body.scrollHeight : 0,
+    doc && doc.documentElement ? doc.documentElement.scrollHeight : 0
+  );
+}
+
+// The height an email-body iframe should be, given the content height its
+// document reported and the visible height of its scroll container.
+//
+// The iframe must never be SHORTER than its content: a shorter iframe puts
+// a nested scrollbar inside the message body — the "fixed height window"
+// bug where you have to scroll inside the message to read it. So content
+// taller than the pane keeps its full height and the OUTER container (the
+// preview pane / modal thread) scrolls instead. Content shorter than the
+// available space fills the entire pane, so a message always uses the full
+// reading area. The 80px floor keeps tiny/empty bodies visible.
+export function frameDisplayHeight(contentHeight, availableHeight) {
+  return Math.max(contentHeight, availableHeight, 80);
+}
+
+// The visible height an email-body iframe can occupy: the client height of
+// its scroll container — the preview pane in the three-column view, the
+// modal thread in the full-width modal. Falls back to the window height
+// when the frame is not (yet) inside either container.
+export function frameAvailableHeight(frame) {
+  const container = frame.closest("#preview-pane, #modal-thread");
+  return container ? container.clientHeight : window.innerHeight;
+}
