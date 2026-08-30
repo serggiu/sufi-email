@@ -7,6 +7,8 @@ import {
   loadLastSelection,
   loadFolderSelection,
   clearFolderSelection,
+  loadSidebarVisible,
+  saveSidebarVisible,
 } from "./selection.js";
 
 function mockStorage() {
@@ -92,5 +94,27 @@ describe("selection storage", () => {
   it("builds stable keys", () => {
     expect(selectionKey("Sergiu T", "INBOX")).toBe("Sergiu T::INBOX");
     expect(selectionKey("a", "b::c")).toBe("a::b::c");
+  });
+});
+
+describe("sidebar visibility persistence", () => {
+  let storage;
+  beforeEach(() => {
+    storage = mockStorage();
+  });
+
+  it("defaults to visible when nothing was stored", () => {
+    expect(loadSidebarVisible(storage)).toBe(true);
+  });
+
+  it("reopens hidden after the user hid the folders column", () => {
+    saveSidebarVisible(storage, false);
+    expect(loadSidebarVisible(storage)).toBe(false);
+  });
+
+  it("round-trips back to visible", () => {
+    saveSidebarVisible(storage, false);
+    saveSidebarVisible(storage, true);
+    expect(loadSidebarVisible(storage)).toBe(true);
   });
 });

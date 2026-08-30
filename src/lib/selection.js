@@ -65,3 +65,21 @@ export function clearFolderSelection(storage, account, folder) {
     } catch (_) {}
   }
 }
+
+// Folders-column visibility, persisted so hiding the sidebar survives a
+// restart: the app reopens with the folders hidden until the user toggles
+// them back on.
+export const SIDEBAR_VISIBLE_KEY = "sufi-sidebar-visible";
+
+export function loadSidebarVisible(storage) {
+  const raw = storage.getItem(SIDEBAR_VISIBLE_KEY);
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  return true; // default: folders visible
+}
+
+export function saveSidebarVisible(storage, visible) {
+  try {
+    storage.setItem(SIDEBAR_VISIBLE_KEY, String(visible));
+  } catch (_) {}
+}

@@ -3,6 +3,8 @@ import {
   loadFolderSelection,
   saveSelection,
   clearFolderSelection,
+  loadSidebarVisible,
+  saveSidebarVisible,
 } from "./lib/selection.js";
 import { fmtDate, fmtSize, escapeHtml, withEmailCsp } from "./lib/format.js";
 import {
@@ -28,7 +30,7 @@ const state = {
   folder: null,
   messages: [],
   selectedUid: null,
-  sidebarVisible: true,
+  sidebarVisible: loadSidebarVisible(localStorage),
   online: true,
 };
 
@@ -1215,6 +1217,8 @@ function toggleSidebar() {
     folders.classList.toggle("hidden-col", !state.sidebarVisible);
     document.body.classList.remove("narrow-folders");
   }
+  // Remember the choice so the app reopens the same way next launch.
+  saveSidebarVisible(localStorage, state.sidebarVisible);
 }
 
 // Keep column visibility consistent when the window is resized.
