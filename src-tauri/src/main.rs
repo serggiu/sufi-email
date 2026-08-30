@@ -87,6 +87,18 @@ fn update_tray_icon(app: &tauri::AppHandle) {
     }
 }
 
+/// Whether we are running under the Hyprland compositor (e.g. Omarchy).
+/// Hyprland never draws title bars itself — windows run undecorated and are
+/// moved/resized with its SUPER+drag bindings — so an app-drawn title bar
+/// sticks out against every other window there. Detected from the
+/// environment Hyprland injects into every client.
+fn is_hyprland() -> bool {
+    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok()
+        || std::env::var("XDG_CURRENT_DESKTOP")
+            .map(|d| d.to_lowercase().contains("hyprland"))
+            .unwrap_or(false)
+}
+
 /// Create the tray icon with its menu, and wire "Open Sufi Email" / "Quit".
 /// Note: on Linux the tray backend (libappindicator) does not deliver icon
 /// click events — the host shows the menu on click, so "Open Sufi Email" is
@@ -1388,6 +1400,18 @@ fn main() {
             if let Some(colors) = theme::read_theme_colors() {
                 log::info!("system theme: {} ({})", colors.mode, colors.background);
             }
+            // Hyprland/Omarchy convention: windows have no title bars. The
+            // compositor draws only borders, so hide the client-side title
+            // bar there; other desktops keep it (the title bar is expected
+            // on ordinary X11/Wayland desktops).
+            if is_hyprland() {
+                if let Some(window) = app.get_webview_window("main") {
+                    match window.set_decorations(false) {
+                        Ok(()) => log::info!("hidden window decorations (Hyprland)"),
+                        Err(e) => log::warn!("could not hide window decorations: {e}"),
+                    }
+                }
+            }
             setup_tray(app.handle())?;
             update_tray_icon(app.handle());
             Ok(())
@@ -1453,6 +1477,36 @@ mod main_tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "saved attachments must be owner-only");
+        }
+    }
+
+    #[test]
+    fn hyprland_detection_reads_the_client_environment() {
+        let prev_sig = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
+        let prev_desk = std::env::var_os("XDG_CURRENT_DESKTOP");
+
+        // Hyprland sets an instance signature for every client.
+        std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", "efb50993");
+        std::env::remove_var("XDG_CURRENT_DESKTOP");
+        assert!(super::is_hyprland());
+
+        // XDG_CURRENT_DESKTOP fallback.
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "Hyprland");
+        assert!(super::is_hyprland());
+
+        // Neither set: not Hyprland (title bar stays).
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+        std::env::set_var("XDG_CURRENT_DESKTOP", "GNOME");
+        assert!(!super::is_hyprland());
+
+        match prev_sig {
+            Some(v) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v),
+            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
+        }
+        match prev_desk {
+            Some(v) => std::env::set_var("XDG_CURRENT_DESKTOP", v),
+            None => std::env::remove_var("XDG_CURRENT_DESKTOP"),
         }
     }
 }
