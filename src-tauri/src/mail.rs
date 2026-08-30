@@ -120,6 +120,21 @@ pub fn list_folder_uids(acc: &AccountConfig, folder: &str) -> Result<Vec<u32>, S
     Ok(uids)
 }
 
+/// Number of messages without \Seen in a folder — the authoritative server
+/// count, used to keep the tray icon truthful from the background watchers
+/// (which have no live session of their own). Blocking IMAP; callers
+/// should run it on a worker thread.
+pub fn folder_unseen_count(acc: &AccountConfig, folder: &str) -> Result<u32, String> {
+    let mut session = imap_session(acc)?;
+    session
+        .select(folder)
+        .map_err(|e| format!("SELECT {folder} failed: {e}"))?;
+    let unseen = session
+        .search("UNSEEN")
+        .map_err(|e| format!("SEARCH UNSEEN failed: {e}"))?;
+    Ok(unseen.len() as u32)
+}
+
 /// Sender display + subject of one message, for the new-mail notification.
 /// Fetches the header section and parses it with mail-parser — the exact
 /// same decoding the message list applies (RFC 2047 names/subjects, HTML

@@ -125,6 +125,29 @@ fn list_folders_empty_server_returns_inbox() {
     });
 }
 
+#[test]
+fn folder_unseen_count_reports_authoritative_server_count() {
+    with_config_dir(|_| {
+        let state = FakeMailboxState::new();
+        state.add_message("INBOX", FakeMessage::new(0, "one", "a@b.com", 3, false));
+        state.add_message("INBOX", FakeMessage::new(0, "two", "a@b.com", 2, false));
+        state.add_message("INBOX", FakeMessage::new(0, "three", "a@b.com", 1, true));
+        state.add_message("Sent", FakeMessage::new(0, "read", "me@me.com", 1, true));
+
+        let acc = test_account(&state, "UnseenCount");
+        assert_eq!(
+            crate::mail::folder_unseen_count(&acc, "INBOX").expect("count"),
+            2,
+            "only the two \\Seen-less messages count"
+        );
+        assert_eq!(
+            crate::mail::folder_unseen_count(&acc, "Sent").expect("count"),
+            0,
+            "fully-read folder reports zero"
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Message listing (streaming)
 // ---------------------------------------------------------------------------

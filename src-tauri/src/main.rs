@@ -29,6 +29,15 @@ use tauri::State;
 const TRAY_ICON_GRAY: &[u8] = include_bytes!("../icons/tray-gray.png");
 const TRAY_ICON_BLUE: &[u8] = include_bytes!("../icons/tray-blue.png");
 
+/// How often the background watcher re-issues the IDLE command (seconds).
+/// The imap crate's default is 29 minutes (RFC 2177's inactivity bound),
+/// which is far too slow to notice a dead connection after a network drop:
+/// the watcher would sit blocked in the dormant IDLE wait on the stale
+/// socket and never reconnect to catch up on mail that arrived meanwhile.
+/// Re-issuing every 120s is a trivial amount of traffic, but each re-issue's
+/// DONE/IDLE round trip surfaces a dead link within a couple of minutes.
+const IDLE_KEEPALIVE_SECS: u64 = 120;
+
 fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
     let bytes = if unread > 0 {
         TRAY_ICON_BLUE
@@ -467,6 +476,7 @@ async fn mark_message(
     folder: String,
     uid: u32,
     seen: bool,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u32, String> {
     let cfg = {
@@ -506,6 +516,14 @@ async fn mark_message(
             Ok(local_unread)
         }
     }
+    .map(|unread| {
+        // The store's folder unread count was just updated above, so
+        // repaint the tray icon right away — reading the last unread
+        // message should gray the icon without waiting for a folder
+        // refresh.
+        update_tray_icon(&app);
+        unread
+    })
 }
 
 #[tauri::command]
@@ -1124,6 +1142,11 @@ fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig) {
             }
             Err(e) => {
                 log::warn!("background watcher for {} lost: {e}; retrying in {backoff}s", acc.email);
+                // Tell the frontend the link is down so it starts its
+                // recovery polling — this is the reliable offline signal
+                // (the webview's window "offline" event is not dependable
+                // on Linux/WebKitGTK). Idempotent on the JS side.
+                let _ = app.emit("connection-lost", ());
                 std::thread::sleep(Duration::from_secs(backoff));
                 backoff = (backoff * 2).min(60);
             }
@@ -1137,7 +1160,11 @@ fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig) {
 fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig) {
     loop {
         std::thread::sleep(Duration::from_secs(15 * 60));
-        let Some(inbox) = inbox_folder_name(acc) else { continue };
+        let Some(inbox) = inbox_folder_name(acc) else {
+            // Folder listing failed — the server is unreachable.
+            let _ = app.emit("connection-lost", ());
+            continue;
+        };
         match mail::list_folder_uids(acc, &inbox) {
             Ok(uids) => {
                 let new = diff_new_uids(acc, &inbox, &uids);
@@ -1154,9 +1181,22 @@ fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig) {
                     fire_new_mail_notification(&from, &subject, extra);
                 }
                 flush_pending_flags(app);
+                // Keep the tray icon truthful from the backend: store the
+                // server's authoritative unread count and repaint (the
+                // frontend's folder-refresh path can lag while the UI
+                // thinks it is offline).
+                if let Ok(unseen) = mail::folder_unseen_count(acc, &inbox) {
+                    if let Ok(mut store) = store::Store::open(acc) {
+                        let _ = store.set_folder_unread(&inbox, unseen);
+                    }
+                }
+                update_tray_icon(app);
                 let _ = app.emit("mail-refresh", ());
             }
-            Err(e) => log::warn!("slow poll for {} failed: {e}", acc.email),
+            Err(e) => {
+                log::warn!("slow poll for {} failed: {e}", acc.email);
+                let _ = app.emit("connection-lost", ());
+            }
         }
     }
 }
@@ -1218,7 +1258,17 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
         use imap::extensions::idle::WaitOutcome;
         // Bind the outcome first so the temporary IDLE handle (which borrows
         // the session mutably) is dropped before we touch the session again.
-        let outcome = session.idle().wait_while(imap::extensions::idle::stop_on_any);
+        // The keepalive timeout is far shorter than the crate default (29
+        // minutes): every expiry re-issues IDLE, which keeps the connection
+        // fresh AND surfaces a dead link — the re-issue's DONE/IDLE round
+        // trip fails on a connection that died while we were offline.
+        // Without this, a network drop leaves the watcher blocked in the
+        // dormant IDLE wait and it never reconnects to catch up on mail.
+        let outcome = {
+            let mut idle = session.idle();
+            idle.timeout(Duration::from_secs(IDLE_KEEPALIVE_SECS));
+            idle.wait_while(imap::extensions::idle::stop_on_any)
+        };
         match outcome {
             Ok(WaitOutcome::MailboxChanged) => {
                 // The server pushed a mailbox change — most likely new mail.
@@ -1272,16 +1322,29 @@ fn process_inbox_change(
         // the user opens/refreshes it — the toast should not beat the
         // message.
         warm_inbox_cache(acc, inbox);
+        // Keep the tray icon truthful from the backend itself: refresh the
+        // inbox's cached unread count from this very session and repaint.
+        // The frontend normally does this via its folder refresh, but that
+        // path is skipped while the UI thinks it is offline — exactly when
+        // a reconnect catch-up like this one runs. Only done when new mail
+        // arrived so quiet change pings (e.g. Dovecot's "Still here") don't
+        // pay for a SEARCH round trip.
+        if let Ok(unseen) = session.search("UNSEEN") {
+            if let Ok(mut store) = store::Store::open(acc) {
+                let _ = store.set_folder_unread(inbox, unseen.len() as u32);
+            }
+        }
+        update_tray_icon(app);
     }
     flush_pending_flags(app);
     let _ = app.emit("mail-refresh", ());
     Ok(())
 }
 
-/// The configured auto-refresh interval in minutes (0 = off).
 #[tauri::command]
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();    let mut config = Config::load_or_default();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    let mut config = Config::load_or_default();
     config.migrate_plaintext_passwords();
     // The system tray's StatusNotifierItem Title comes from the glib
     // application name (libappindicator reads g_get_application_name()), and
