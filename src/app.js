@@ -20,6 +20,11 @@ import {
   EMAIL_FRAME_SANDBOX,
 } from "./lib/mailview.js";
 import { omarchyThemeToCssVars, applyThemeVars, THEME_VAR_NAMES } from "./lib/theme.js";
+import {
+  shouldHandleFrameLoad,
+  emailLinkUrlFromMessage,
+  hrefFromEmailClick,
+} from "./lib/links.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
 
@@ -931,11 +936,12 @@ async function renderThread(subjectEl, metaEl, container, thread) {
 
     const frame = document.createElement("iframe");
     frame.className = "thread-msg-frame";
-    // Same-origin sandbox: scripts, forms, popups and navigation inside the
-    // email are all blocked (the sandbox AND the injected CSP forbid
-    // scripts), but the parent can read the document to size the frame and
-    // intercept link clicks — the in-iframe sizing script approach was
-    // unreliable in the release webview, so the host measures directly.
+    // Sandboxed body frame: same-origin (so the parent can measure the
+    // message and act as a click backstop) + allow-scripts — it lets the
+    // injected nonce'd link handler run inside the email, the only way
+    // WebKitGTK delivers real clicks to a handler. The email's own scripts
+    // stay blocked (they lack the nonce); forms, popups and navigation are
+    // blocked by the sandbox flags we omit.
     frame.sandbox = EMAIL_FRAME_SANDBOX;
     initMessageFrame(frame);
     const attsBox = document.createElement("div");
@@ -1686,17 +1692,22 @@ function initMailRefreshListener() {
 
 // Wire a freshly created email-body iframe: measure its content from the
 // parent (the frame is sandboxed same-origin so its document is readable)
-// once it loads, keep the measurement current via a ResizeObserver, and
-// forward http(s) link clicks to the system browser.
+// when the message loads, keep the measurement current via a ResizeObserver,
+// and attach a parent-side link-click listener as a backstop for the
+// nonce'd script injected inside the email.
+//
+// The frame is created empty and navigated to its srcdoc afterwards, and
+// WebKitGTK fires a `load` event for BOTH documents — the initial
+// about:blank one and the real about:srcdoc content. The handler must skip
+// the blank document (measuring/attaching there would operate on a
+// document that is immediately discarded), so it is deliberately NOT
+// once-only.
 function initMessageFrame(frame) {
-  frame.addEventListener(
-    "load",
-    () => {
-      sizeFrameFromParent(frame);
-      attachFrameLinkHandler(frame);
-    },
-    { once: true }
-  );
+  frame.addEventListener("load", () => {
+    if (!shouldHandleFrameLoad(frame.contentDocument)) return;
+    sizeFrameFromParent(frame);
+    attachFrameLinkHandler(frame);
+  });
 }
 
 // Size the iframe from its own document: the content height it reports via
@@ -1719,9 +1730,15 @@ function sizeFrameFromParent(frame) {
   }
 }
 
-// Intercept clicks on http(s) links inside the email (the email document
-// cannot run scripts — sandbox + CSP — so this is the only handler) and
-// open them in the system browser instead of navigating the iframe.
+// Parent-side click backstop for http(s) links inside the email. The
+// PRIMARY handler is the nonce'd script injected into the message (see
+// withEmailCsp): WebKitGTK does not deliver real clicks to listeners the
+// parent attaches to a JS-created srcdoc iframe's document, but DOES run
+// scripts inside the frame — so the injected script intercepts the click
+// and forwards the URL via postMessage (handled by initExternalLinks).
+// This listener still covers the case where that script could not run; it
+// checks e.defaultPrevented so the two handlers never open the same link
+// twice.
 function attachFrameLinkHandler(frame) {
   const doc = frame.contentDocument;
   if (!doc || doc.__sufiLinks) return;
@@ -1729,20 +1746,35 @@ function attachFrameLinkHandler(frame) {
   doc.addEventListener(
     "click",
     (e) => {
-      const t = e.target;
-      const a = t && t.closest ? t.closest("a[href]") : null;
-      if (!a || e.defaultPrevented || e.button !== 0) return;
-      const href = a.href || "";
-      if (!/^https?:\/\//i.test(href)) return;
+      const href = hrefFromEmailClick(e);
+      if (!href) return;
       e.preventDefault();
-      if (window.__TAURI__ && window.__TAURI__.opener) {
-        window.__TAURI__.opener
-          .openUrl(href)
-          .catch((err) => showError(String(err)));
-      }
+      openUrlInBrowser(href);
     },
     true
   );
+}
+
+// Open an http(s) URL in the system's default browser via the opener
+// plugin. All link clicks from inside emails funnel through here.
+function openUrlInBrowser(href) {
+  if (!window.__TAURI__ || !window.__TAURI__.opener) return;
+  window.__TAURI__.opener
+    .openUrl(href)
+    .catch((err) => showError(String(err)));
+}
+
+// Links inside the sandboxed email iframes are intercepted by the nonce'd
+// script injected into the message body (see withEmailCsp) and forwarded
+// here, so they open in the system's default browser instead of being
+// dead. Only http(s) URLs are ever opened.
+function initExternalLinks() {
+  if (!window.__TAURI__ || !window.__TAURI__.opener) return;
+  window.addEventListener("message", (e) => {
+    const url = emailLinkUrlFromMessage(e.data);
+    if (!url) return;
+    openUrlInBrowser(url);
+  });
 }
 
 // Auto-size every email-body iframe from the parent: content shorter than
@@ -1850,6 +1882,7 @@ function init() {
 
   initMailRefreshListener();
   initFrameSizing();
+  initExternalLinks();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   $("compose-attach").addEventListener("click", attachFiles);
   document.getElementById("compose-form").addEventListener("submit", sendCompose);

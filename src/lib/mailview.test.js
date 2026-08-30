@@ -204,11 +204,14 @@ describe("renderViewBody", () => {
     const view = mockView();
     await renderViewBody(view, { text: "<script>alert(1)</script>" });
     // The email's script is escaped to inert text — no real <script>
-    // element exists in the sandboxed document (scripts are forbidden by
-    // its CSP and the sandbox itself).
+    // element from the message exists (the sender's markup is escaped; only
+    // the injected nonce'd link handler is a genuine script, and the email
+    // cannot run its own code because it lacks the nonce).
     expect(view.frame.srcdoc).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     expect(view.frame.srcdoc).not.toContain(">alert(1)<");
-    expect(view.frame.srcdoc).not.toContain("<script");
+    // The only <script> in the document is the injected nonce'd handler.
+    expect(view.frame.srcdoc).not.toContain("<script>alert(1)");
+    expect(view.frame.srcdoc).toContain('<script nonce="');
   });
   it("shows an empty-message placeholder", async () => {
     const view = mockView();
@@ -270,12 +273,20 @@ describe("email frame sandbox + parent-side measurement (reading-pane fix)", () 
     expect(EMAIL_FRAME_SANDBOX).toContain("allow-same-origin");
   });
 
-  it("still forbids scripts inside the email document", () => {
-    // No allow-scripts in the sandbox and no script allowance in the email
-    // CSP: the untrusted message stays script-free even though it shares
-    // the origin (so the parent can measure it).
-    expect(EMAIL_FRAME_SANDBOX).not.toContain("allow-scripts");
-    expect(withEmailCsp("<html><head></head><body>hi</body></html>")).toContain(
+  it("keeps email scripts blocked by the injected CSP", () => {
+    // The sandbox includes allow-scripts — it is what lets the injected
+    // nonce'd link handler run inside the email (the only way WebKitGTK
+    // delivers real clicks to a handler) — but the email's own scripts must
+    // stay dead: the injected CSP allows exactly one script, pinned by a
+    // random nonce the email cannot know, so the untrusted message cannot
+    // execute its own code even though it shares the origin (which the
+    // parent needs to measure the frame).
+    expect(EMAIL_FRAME_SANDBOX).toContain("allow-same-origin");
+    expect(EMAIL_FRAME_SANDBOX).toContain("allow-scripts");
+    expect(withEmailCsp("<html><head></head><body>hi</body></html>")).toMatch(
+      /script-src 'nonce-[0-9a-f]+'/
+    );
+    expect(withEmailCsp("<html><head></head><body>hi</body></html>")).not.toContain(
       "script-src 'none'"
     );
   });

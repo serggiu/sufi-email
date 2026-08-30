@@ -117,9 +117,10 @@ export function rewriteCidImages(html, cidMap) {
     });
 }
 
-// Render inside a fully sandboxed iframe (no scripts, no same-origin).
-// A CSP meta tag additionally blocks remote resources — most importantly
-// remote images, so tracking pixels in HTML mail cannot phone home.
+// Render inside a sandboxed iframe. The injected CSP meta tag allows exactly
+// one script (the nonce'd link handler, see withEmailCsp) and blocks all
+// network — most importantly remote images, so tracking pixels in HTML mail
+// cannot phone home. The email's own scripts stay dead (no matching nonce).
 export async function renderViewBody(view, body) {
   const content =
     body.html ??
@@ -129,17 +130,31 @@ export async function renderViewBody(view, body) {
   view.frame.srcdoc = await withEmailCsp(content);
 }
 
-// The sandbox flags for the email-body iframe: same-origin ONLY, so the
-// host can read the message document to size the frame and intercept link
-// clicks. Scripts, forms, popups and navigation stay blocked — by the
-// sandbox (no allow-scripts) AND by the injected CSP (script-src 'none').
+// The sandbox flags for the email-body iframe. Two flags are required:
+//
+//  - allow-same-origin: the host reads the message document from the parent
+//    to size the frame (and as a click-handler backstop).
+//  - allow-scripts: it lets the injected link-handler script (see
+//    withEmailCsp) run inside the email. This is the ONLY reliable way to
+//    catch real clicks on links in WebKitGTK: a click on a link is not
+//    delivered to a listener the parent attaches to a JS-created srcdoc
+//    iframe's document (verified on webkit2gtk-4.1, 2.52.6), but it IS
+//    delivered to a script running inside the frame's own document. The
+//    handler forwards http(s) URLs to the host via postMessage.
+//
+// allow-scripts does NOT let the email run arbitrary code: the injected CSP
+// allows exactly one script — the handler — pinned by a fresh random nonce
+// the email cannot know; the email's own scripts, inline event handlers and
+// javascript: URLs stay blocked. Forms, popups and navigation stay blocked
+// by the flags we deliberately omit (no allow-forms, allow-popups,
+// allow-top-navigation).
 //
 // Regression guard for the reading-pane fix: sizing depends on the parent
 // being able to read the frame's document, which requires allow-same-origin.
-// The previous approach (allow-scripts + a script inside the email posting
-// its height) never ran in the release webview, leaving every message in a
-// fixed ~150px box.
-export const EMAIL_FRAME_SANDBOX = "allow-same-origin";
+// The previous approach (allow-scripts + a hash-pinned script inside the
+// email posting its height) never ran in the release webview, leaving every
+// message in a fixed ~150px box.
+export const EMAIL_FRAME_SANDBOX = "allow-same-origin allow-scripts";
 
 // The content height of an email document, measured from the parent: the
 // taller of the body and documentElement scroll heights. 0 when the

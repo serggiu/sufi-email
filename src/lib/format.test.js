@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { fmtDate, fmtSize, escapeHtml, withEmailCsp } from "./format.js";
+import { JSDOM } from "jsdom";
+import { fmtDate, fmtSize, escapeHtml, withEmailCsp, LINK_HANDLER_CODE } from "./format.js";
 
 describe("fmtSize", () => {
   it("formats bytes", () => {
@@ -30,7 +31,7 @@ describe("withEmailCsp", () => {
     const html = "<html><head><title>x</title></head><body>hi</body></html>";
     const out = withEmailCsp(html);
     expect(out).toContain('meta http-equiv="Content-Security-Policy"');
-    expect(out).toContain("default-src 'none'; script-src 'none'; img-src data:");
+    expect(out).toMatch(/default-src 'none'; script-src 'nonce-[0-9a-f]+'; img-src data:/);
     expect(out.indexOf("<head>") < out.indexOf("meta http-equiv")).toBe(true);
   });
   it("prepends the meta when there is no head", () => {
@@ -42,18 +43,39 @@ describe("withEmailCsp", () => {
     expect(out).toContain("img-src data:");
     expect(out).not.toContain("https:");
   });
-  it("forbids all scripts (the parent app handles sizing and links)", () => {
+  it("allows exactly one nonce'd script: the link handler", () => {
     const out = withEmailCsp("<html><head></head><body>hi</body></html>");
-    // No <script> element is injected, and the policy allows none.
-    expect(out).not.toContain("<script");
-    expect(out).toContain("script-src 'none'");
+    // The injected handler script carries the same nonce as the policy.
+    const nonce = /script-src 'nonce-([0-9a-f]+)'/.exec(out)[1];
+    expect(out).toContain(`<script nonce="${nonce}">`);
+    expect(out).toContain("sufi-open-url");
+    expect(out).toContain("window.parent.postMessage");
+    // And nothing else script-shaped is added by the wrapper.
+    expect((out.match(/<script/g) || []).length).toBe(1);
   });
-  it("keeps the email's own scripts inert (no hash whitelist)", () => {
+  it("uses a fresh nonce per message, so emails cannot guess it", () => {
+    const a = withEmailCsp("<html><head></head><body>x</body></html>");
+    const b = withEmailCsp("<html><head></head><body>x</body></html>");
+    const na = /script-src 'nonce-([0-9a-f]+)'/.exec(a)[1];
+    const nb = /script-src 'nonce-([0-9a-f]+)'/.exec(b)[1];
+    expect(na).not.toBe(nb);
+  });
+  it("keeps the email's own scripts inert (they have no nonce)", () => {
     const html = "<html><head></head><body><script>alert(1)</script></body></html>";
     const out = withEmailCsp(html);
-    // The email's script stays in the document but the policy forbids it.
-    expect(out).toContain("script-src 'none'");
+    // The email's script stays in the document but the policy forbids it
+    // (no matching nonce); only the injected handler has the nonce.
     expect(out).toContain("<script>alert(1)</script>");
+    const nonce = /script-src 'nonce-([0-9a-f]+)'/.exec(out)[1];
+    expect(out).toContain(`<script nonce="${nonce}">`);
+    expect(out).not.toContain(`<script nonce="${nonce}">alert(1)`);
+  });
+  it("inserts the handler inside the document so the parser runs it", () => {
+    const out = withEmailCsp("<html><head></head><body>hi</body></html>");
+    const bodyEnd = out.indexOf("</body>");
+    const scriptAt = out.indexOf("<script nonce=");
+    expect(scriptAt).toBeGreaterThan(-1);
+    expect(scriptAt).toBeLessThan(bodyEnd);
   });
 });
 
@@ -71,10 +93,95 @@ describe("fmtDate", () => {
   });
 });
 
-describe("withEmailCsp hash integrity", () => {
-  it("injects a script-free policy (no inline handler to hash)", () => {
+describe("withEmailCsp link-handler policy", () => {
+  it("pins the handler with a nonce instead of a hash", () => {
     const out = withEmailCsp("<html><head></head><body>hi</body></html>");
+    expect(out).toContain("script-src 'nonce-");
     expect(out).not.toContain("sha256-");
-    expect(out).not.toContain("<script");
+  });
+});
+
+// Run the ACTUAL injected handler code in a fresh window and verify it
+// forwards link clicks to the parent — the behavior the whole feature
+// rests on, not just its presence in the markup.
+describe("LINK_HANDLER_CODE behavior", () => {
+  // A fresh window whose document already ran the real handler code, the
+  // same way it runs inside a rendered email (as a <script> in the body).
+  const freshWindow = () => {
+    const dom = new JSDOM(
+      "<!DOCTYPE html><html><body></body></html>" +
+        `<script>${LINK_HANDLER_CODE}</script>`,
+      {
+        url: "https://app.local/",
+        runScripts: "dangerously",
+        // Keep jsdom's default action for javascript: links (an alert
+        // dialog) from printing an unhandled-warning to the test output.
+        beforeParse(win) {
+          win.alert = () => {};
+        },
+      }
+    );
+    return dom.window;
+  };
+  const addLink = (win, href) => {
+    const a = win.document.createElement("a");
+    a.href = href;
+    a.textContent = "link";
+    win.document.body.appendChild(a);
+    return a;
+  };
+
+  it("posts the http(s) URL to the parent on a left-click and prevents navigation", () => {
+    const win = freshWindow();
+    const posted = [];
+    win.parent.postMessage = (msg, target) => posted.push({ msg, target });
+
+    const a = addLink(win, "https://example.com/x");
+    const ev = new win.MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+    });
+    a.dispatchEvent(ev);
+
+    expect(posted).toEqual([
+      { msg: { type: "sufi-open-url", url: "https://example.com/x" }, target: "*" },
+    ]);
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("does not forward non-http(s) links", () => {
+    const win = freshWindow();
+    const posted = [];
+    win.parent.postMessage = (msg, target) => posted.push({ msg, target });
+
+    const a = addLink(win, "javascript:alert(1)");
+    a.dispatchEvent(
+      new win.MouseEvent("click", { bubbles: true, cancelable: true, button: 0 })
+    );
+
+    expect(posted).toEqual([]);
+  });
+
+  it("does not forward right-clicks or already-handled clicks", () => {
+    const win = freshWindow();
+    const posted = [];
+    win.parent.postMessage = (msg, target) => posted.push({ msg, target });
+
+    const a = addLink(win, "https://example.com/x");
+
+    a.dispatchEvent(
+      new win.MouseEvent("click", { bubbles: true, cancelable: true, button: 2 })
+    );
+    expect(posted).toEqual([]);
+
+    const ev = new win.MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+    });
+    ev.preventDefault(); // someone already handled it
+    a.dispatchEvent(ev);
+    expect(posted).toEqual([]);
   });
 });
