@@ -11,6 +11,10 @@
   /* Semantic colors, overridden by the active Omarchy theme (see theme.js). */
   --danger: #f7768e;
   --warn: #f0a35e;
+  /* Text on accent/danger-colored surfaces; shadows for menus/dialogs. */
+  --on-accent: #10131c;
+  --on-danger: #10131c;
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -71,7 +75,7 @@ button:hover { background: var(--bg-hover); }
   background: var(--bg-alt);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow);
   z-index: 50;
   padding: 4px;
 }
@@ -103,7 +107,7 @@ button:hover { background: var(--bg-hover); }
   background: var(--bg-alt);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow);
   padding: 4px;
   z-index: 100;
   display: none;
@@ -194,7 +198,7 @@ button:hover { background: var(--bg-hover); }
   text-align: center;
   font-size: 11px;
   font-weight: 600;
-  color: #10131c;
+  color: var(--on-accent);
   background: var(--accent);
   border-radius: 9px;
   padding: 1px 5px;
@@ -322,7 +326,7 @@ li.read .msg-snippet { opacity: 0.7; }
   padding: 9px 18px;
   background: var(--accent);
   border-color: var(--accent);
-  color: #10131c;
+  color: var(--on-accent);
 }
 
 /* ---- preview column ---- */
@@ -406,7 +410,7 @@ li.read .msg-snippet { opacity: 0.7; }
   background: var(--bg-alt);
   border: 1px solid var(--border);
   border-radius: 8px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow);
   z-index: 50;
   padding: 4px;
 }
@@ -487,7 +491,7 @@ dialog input, dialog textarea {
 dialog textarea { resize: vertical; }
 .dialog-buttons, .dialog-buttons * { margin-top: 12px; }
 .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; }
-#compose-send { background: var(--accent); border-color: var(--accent); color: #10131c; }
+#compose-send { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 #compose-error { color: var(--danger); font-size: 13px; margin-top: 8px; }
 
 /* Attachments in the compose dialog. */
@@ -513,7 +517,7 @@ dialog textarea { resize: vertical; }
 #confirm-ok.danger {
   background: var(--danger);
   border-color: var(--danger);
-  color: #10131c;
+  color: var(--on-danger);
 }
 #confirm-ok.danger:hover { filter: brightness(1.1); }
 

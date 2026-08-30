@@ -4,6 +4,7 @@ import {
   mixHex,
   omarchyThemeToCssVars,
   applyThemeVars,
+  contrastText,
   THEME_VAR_NAMES,
 } from "./theme.js";
 
@@ -18,6 +19,21 @@ describe("hexToRgb", () => {
   it("returns null for garbage", () => {
     expect(hexToRgb("nope")).toBeNull();
     expect(hexToRgb("")).toBeNull();
+  });
+});
+
+describe("contrastText", () => {
+  it("returns dark text on light backgrounds and light text on dark ones", () => {
+    expect(contrastText("#ffffff")).toBe("#10131c");
+    expect(contrastText("#000000")).toBe("#ffffff");
+  });
+  it("keeps the built-in dark text on Nord's light accent/danger", () => {
+    expect(contrastText("#81a1c1")).toBe("#10131c");
+    expect(contrastText("#bf616a")).toBe("#10131c");
+  });
+  it("switches to light text on Latte's dark accent and danger", () => {
+    expect(contrastText("#1e66f5")).toBe("#ffffff");
+    expect(contrastText("#d20f39")).toBe("#ffffff");
   });
 });
 
@@ -60,6 +76,10 @@ describe("omarchyThemeToCssVars", () => {
     expect(vars["--bg-active"]).toBe("#434c5e"); // selection
     expect(vars["--danger"]).toBe("#bf616a");
     expect(vars["--warn"]).toBe("#d5967a");
+    // Dark themes keep dark text on accent/danger and a strong shadow.
+    expect(vars["--on-accent"]).toBe("#10131c");
+    expect(vars["--on-danger"]).toBe("#10131c");
+    expect(vars["--shadow"]).toContain("0.4");
     // surface steps sit between background and lighter_background
     const bg = hexToRgb(vars["--bg"]);
     const alt = hexToRgb(vars["--bg-alt"]);
@@ -85,6 +105,10 @@ describe("omarchyThemeToCssVars", () => {
     expect(vars["--bg"]).toBe("#ffffff");
     expect(vars["--text"]).toBe("#333537"); // dark text, 10% lightened toward bg
     expect(vars["--accent"]).toBe("#356fc7");
+    // Light themes get white text on the dark accent/danger and a soft shadow.
+    expect(vars["--on-accent"]).toBe("#ffffff");
+    expect(vars["--on-danger"]).toBe("#ffffff");
+    expect(vars["--shadow"]).toContain("0.18");
   });
 
   it("falls back when a palette field is missing", () => {
@@ -122,6 +146,18 @@ describe("applyThemeVars (DOM application)", () => {
     applyThemeVars(root, null);
     for (const key of THEME_VAR_NAMES) {
       expect(root.style.getPropertyValue(key)).toBe("");
+    }
+  });
+
+  it("THEME_VAR_NAMES covers every variable the mapping produces", () => {
+    const mapped = omarchyThemeToCssVars({
+      mode: "dark",
+      background: "#2e3440",
+      foreground: "#d8dee9",
+      accent: "#81a1c1",
+    });
+    for (const key of Object.keys(mapped)) {
+      expect(THEME_VAR_NAMES).toContain(key);
     }
   });
 });
