@@ -17,6 +17,7 @@ import {
   frameContentHeight,
   EMAIL_FRAME_SANDBOX,
 } from "./lib/mailview.js";
+import { omarchyThemeToCssVars, applyThemeVars, THEME_VAR_NAMES } from "./lib/theme.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
 
@@ -1446,9 +1447,60 @@ function clampFrameHeights() {
   }
 }
 
+// ------------------------------------------------------------ system theme
+//
+// Follow the active Omarchy theme (see theme.rs): the backend reads the
+// current theme's colors.toml and emits `system-theme-changed` when the
+// theme switches; the palette is mapped onto the app's CSS variables. The
+// last applied variables are cached so the UI opens already themed (no
+// flash of the default dark palette) and also themed offline.
+const THEME_CACHE_KEY = "sufi-theme-vars";
+
+function cacheThemeVars(vars) {
+  try {
+    if (vars) localStorage.setItem(THEME_CACHE_KEY, JSON.stringify(vars));
+    else localStorage.removeItem(THEME_CACHE_KEY);
+  } catch (_) {}
+}
+
+function loadCachedThemeVars() {
+  try {
+    const raw = localStorage.getItem(THEME_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Map an Omarchy palette (from the backend) onto the CSS variables and
+// apply + cache it. A null palette resets to the built-in defaults.
+function applySystemTheme(colors) {
+  const vars = omarchyThemeToCssVars(colors);
+  applyThemeVars(document.documentElement, vars);
+  cacheThemeVars(vars);
+}
+
+// Apply the cached theme immediately, then load the real one and follow
+// theme switches for the rest of the session.
+async function initSystemTheme() {
+  applyThemeVars(document.documentElement, loadCachedThemeVars());
+  try {
+    const colors = await invoke("get_system_theme");
+    applySystemTheme(colors);
+  } catch (_) {
+    // No theme command (dev in plain browser): keep the cached/default look.
+  }
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("system-theme-changed", (e) => {
+      applySystemTheme(e.payload);
+    });
+  }
+}
+
 function init() {
   if (!guardTauri()) return;
 
+  initSystemTheme();
   initFontSize();
   initResizers();
   initConnectivityEvents();

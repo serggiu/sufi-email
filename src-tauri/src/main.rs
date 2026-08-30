@@ -6,6 +6,7 @@ mod crypto;
 mod fake_imap;
 mod mail;
 mod store;
+mod theme;
 #[cfg(test)]
 mod account_tests;
 #[cfg(test)]
@@ -1378,6 +1379,15 @@ fn main() {
         })
         .setup(|app| {
             spawn_missing_idle_watchers(app.handle());
+            // Follow the active Omarchy theme: repaint the UI live when the
+            // theme changes (the watcher emits system-theme-changed).
+            {
+                let app2 = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || theme::watch(app2));
+            }
+            if let Some(colors) = theme::read_theme_colors() {
+                log::info!("system theme: {} ({})", colors.mode, colors.background);
+            }
             setup_tray(app.handle())?;
             update_tray_icon(app.handle());
             Ok(())
@@ -1407,7 +1417,8 @@ fn main() {
             delete_message_server,
             get_thread,
             get_attachments_data,
-            send_email
+            send_email,
+            theme::get_system_theme
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

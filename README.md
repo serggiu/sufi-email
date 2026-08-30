@@ -28,6 +28,11 @@ standard IMAP/SMTP accounts, fetches mail, and sends messages.
 - **System tray**: an envelope icon shows unread mail (grey with no
   unread, blue when mail is waiting, tooltip with the count); closing the
   window hides it to the tray, Quit from the tray menu is the real exit
+- **Omarchy theme integration**: on Omarchy systems the app follows the
+  active desktop theme — its palette (background, text, accent, borders,
+  error/warning colors) is mapped onto the UI from the current theme's
+  `colors.toml`, and switching themes repaints the app live. Elsewhere it
+  keeps the built-in dark palette
 - **Multiple accounts**, added and switched from the UI; connections are
   tested before an account is saved
 - Config-driven accounts (`config.toml`), passwords sealed with a
@@ -149,5 +154,4 @@ distros where it is supported.
 - [ ] Google OAuth account support (Gmail API / XOAUTH2)
 - [ ] Full-text message search
 - [ ] Message filters/rules (auto-move, auto-archive)
-- [ ] Dark theme / theme switcher
 - [ ] Rich-text (HTML) composing with inline images
