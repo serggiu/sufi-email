@@ -86,13 +86,13 @@ fn update_tray_icon(app: &tauri::AppHandle) {
     }
 }
 
-/// Create the tray icon with its menu, and wire "Show Email" / "Quit".
+/// Create the tray icon with its menu, and wire "Open Sufi Email" / "Quit".
 /// Note: on Linux the tray backend (libappindicator) does not deliver icon
-/// click events — the host shows the menu on click, so "Show Email" is the
-/// reliable way to open the window there. The left-click handler covers
+/// click events — the host shows the menu on click, so "Open Sufi Email" is
+/// the reliable way to open the window there. The left-click handler covers
 /// platforms/hosts that do report clicks.
 fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show Email", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "Open Sufi Email", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
@@ -124,7 +124,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 /// Show and focus the main window (used by the tray's left-click and the
-/// "Show Email" menu item).
+/// "Open Sufi Email" menu item).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
