@@ -111,6 +111,9 @@ pub fn watch(app: tauri::AppHandle) {
             .as_deref()
             .and_then(|c| toml::from_str::<OmarchyColors>(c).ok());
         let _ = app.emit("system-theme-changed", payload);
+        // The tray envelope follows the theme too (foreground/accent fill),
+        // so repaint it on every theme switch.
+        crate::update_tray_icon(&app);
     }
 }
 

@@ -25,10 +25,10 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 
-/// Envelope icons for the system tray: grey when there are no unread
-/// messages (fits neutral menubar themes), blue when mail is waiting.
-const TRAY_ICON_GRAY: &[u8] = include_bytes!("../icons/tray-gray.png");
-const TRAY_ICON_BLUE: &[u8] = include_bytes!("../icons/tray-blue.png");
+/// Envelope shape for the system tray icon: the embedded white envelope's
+/// alpha channel is the mask; the fill color comes from the active Omarchy
+/// theme (see [`tray_icon`]).
+const TRAY_ICON_SHAPE: &[u8] = include_bytes!("../icons/tray-gray.png");
 
 /// How often the background watcher re-issues the IDLE command (seconds).
 /// The imap crate's default is 29 minutes (RFC 2177's inactivity bound),
@@ -39,13 +39,56 @@ const TRAY_ICON_BLUE: &[u8] = include_bytes!("../icons/tray-blue.png");
 /// DONE/IDLE round trip surfaces a dead link within a couple of minutes.
 const IDLE_KEEPALIVE_SECS: u64 = 120;
 
+/// Parse a "#rrggbb" hex color into (r, g, b).
+fn hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+/// Repaint the embedded envelope shape with the given RGB, keeping its
+/// alpha (the anti-aliased outline), and re-encode it as a PNG for the tray
+/// host. This is how the tray icon follows the active Omarchy theme.
+fn tint_envelope(r: u8, g: u8, b: u8) -> tauri::image::Image<'static> {
+    use image::GenericImageView;
+    use image::ImageEncoder;
+    let img = image::load_from_memory(TRAY_ICON_SHAPE).expect("embedded tray icon decodes");
+    let (w, h) = img.dimensions();
+    let mut out = image::RgbaImage::new(w, h);
+    for (x, y, px) in img.pixels() {
+        out.put_pixel(x, y, image::Rgba([r, g, b, px[3]]));
+    }
+    let mut buf = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(out.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+        .expect("encode tray icon");
+    tauri::image::Image::from_bytes(&buf).expect("encoded tray icon")
+}
+
+/// The tray envelope icon: filled with the active theme's foreground when
+/// there is no unread mail (matching the bar's other tinted icons, e.g.
+/// Slack/Telegram) and the theme's accent when mail is waiting — so the
+/// icon follows the desktop theme while keeping the blue unread cue. Falls
+/// back to the built-in near-white/blue when no Omarchy theme is staged.
 fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
-    let bytes = if unread > 0 {
-        TRAY_ICON_BLUE
+    let theme = theme::read_theme_colors();
+    let (r, g, b) = if unread > 0 {
+        theme
+            .as_ref()
+            .and_then(|t| hex_rgb(&t.accent))
+            .unwrap_or((0x81, 0xa2, 0xc1)) // built-in blue
     } else {
-        TRAY_ICON_GRAY
+        theme
+            .as_ref()
+            .and_then(|t| hex_rgb(&t.foreground))
+            .unwrap_or((0xec, 0xec, 0xef)) // built-in near-white
     };
-    tauri::image::Image::from_bytes(bytes).expect("embedded tray icon")
+    tint_envelope(r, g, b)
 }
 
 /// Sum of unread messages across every configured account (from the cache).
@@ -77,7 +120,7 @@ fn tray_tooltip(unread: u32) -> String {
 /// Title and ToolTip are updated (the vendored tray-icon patches make
 /// set_title/set_tooltip work on Linux); tray hosts like omarchy prefer the
 /// ToolTip.
-fn update_tray_icon(app: &tauri::AppHandle) {
+pub(crate) fn update_tray_icon(app: &tauri::AppHandle) {
     let unread = total_unread(app);
     let tooltip = tray_tooltip(unread);
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -1478,6 +1521,36 @@ mod main_tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "saved attachments must be owner-only");
         }
+    }
+
+    #[test]
+    fn hex_rgb_parses_and_rejects() {
+        assert_eq!(super::hex_rgb("#81a1c1"), Some((0x81, 0xa1, 0xc1)));
+        assert_eq!(super::hex_rgb("81a1c1"), Some((0x81, 0xa1, 0xc1)));
+        assert_eq!(super::hex_rgb("#f0f"), None); // shorthand not supported
+        assert_eq!(super::hex_rgb("nope"), None);
+        assert_eq!(super::hex_rgb(""), None);
+    }
+
+    #[test]
+    fn tint_envelope_repaints_the_shape_and_keeps_alpha() {
+        let img = super::tint_envelope(0x81, 0xa1, 0xc1);
+        assert_eq!(img.width(), 256);
+        assert_eq!(img.height(), 256);
+        let rgba = img.rgba();
+        // The opaque envelope area is filled with the requested color.
+        let mut opaque = 0usize;
+        let mut colored_ok = true;
+        for px in rgba.chunks_exact(4) {
+            if px[3] > 0 {
+                opaque += 1;
+                if px[0] != 0x81 || px[1] != 0xa1 || px[2] != 0xc1 {
+                    colored_ok = false;
+                }
+            }
+        }
+        assert!(opaque > 0, "envelope shape present");
+        assert!(colored_ok, "every opaque pixel carries the requested RGB");
     }
 
     #[test]
