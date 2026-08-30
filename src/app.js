@@ -1367,7 +1367,14 @@ function renderAccountsMenu() {
     del.textContent = "Delete";
     del.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (!confirm(`Delete account '${acc.name}'?`)) return;
+      const proceed = await confirmDialog(
+        `Delete account '${acc.name}'?`,
+        `The account '${acc.name}' (${acc.email}) will be removed from this ` +
+        `app and its locally cached mail will be deleted. Messages on the ` +
+        `server are not affected.`,
+        "Delete"
+      );
+      if (!proceed) return;
       try {
         await invoke("delete_account", { account: acc.name });
         await refreshAccounts(null);

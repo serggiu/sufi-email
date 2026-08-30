@@ -17,7 +17,9 @@ mod crypto_tests;
 mod store_tests;
 
 use account::{AccountConfig, AccountInfo, Config};
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -192,10 +194,12 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 pub struct AppState {
     pub config: Mutex<Config>,
-    /// Accounts that currently have a live IDLE watcher thread. Used to
-    /// avoid spawning duplicate watchers when new accounts are added at
-    /// runtime.
-    pub idle_watched: Mutex<std::collections::HashSet<String>>,
+    /// Accounts that currently have a live watcher thread (IDLE or slow
+    /// poll), keyed by account name and mapped to the watcher's stop flag.
+    /// Used to avoid spawning duplicate watchers when new accounts are
+    /// added at runtime, and so delete_account can stop a watcher before
+    /// removing the account's local cache.
+    pub idle_watchers: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 /// Fire the silent new-mail toast through the OS notification daemon.
@@ -337,6 +341,15 @@ async fn delete_account(
     let result = cfg.save();
     drop(cfg);
     result?;
+
+    // Stop the account's background watcher (if any) and deregister it
+    // BEFORE removing the cache. Otherwise a watcher mid-cycle could
+    // re-create the local database after it was deleted (the watcher
+    // re-checks the config and its stop flag at every opportunity and
+    // exits within one IDLE keepalive interval at most).
+    if let Some(stop) = state.idle_watchers.lock().unwrap().remove(&account) {
+        stop.store(true, Ordering::Release);
+    }
 
     // Remove the account's local mail cache (best effort).
     if let Some(acc) = removed {
@@ -1037,6 +1050,12 @@ fn flush_pending_flags(app: &tauri::AppHandle) {
     let accounts = st.config.lock().unwrap().accounts.clone();
     drop(st);
     for acc in &accounts {
+        // The account may have been deleted while we were connecting;
+        // never push changes for (or re-create the cache of) an account
+        // that no longer exists.
+        if !account_configured(app, &acc.name) {
+            continue;
+        }
         let Ok(mut store) = store::Store::open(acc) else { continue };
         let pending = match store.pending_flags() {
             Ok(p) => p,
@@ -1189,14 +1208,16 @@ fn cached_preview(acc: &AccountConfig, inbox: &str, new_uids: &[u32]) -> (String
 fn spawn_missing_idle_watchers(app: &tauri::AppHandle) {
     let st = app.state::<AppState>();
     let accounts = st.config.lock().unwrap().accounts.clone();
-    let mut watched = st.idle_watched.lock().unwrap();
+    let mut watchers = st.idle_watchers.lock().unwrap();
     for acc in &accounts {
-        if watched.insert(acc.name.clone()) {
+        if !watchers.contains_key(&acc.name) {
+            let stop = Arc::new(AtomicBool::new(false));
+            watchers.insert(acc.name.clone(), stop.clone());
             let app2 = app.clone();
             let acc2 = acc.clone();
             log::info!("starting IDLE watcher for {}", acc.email);
             tauri::async_runtime::spawn_blocking(move || {
-                idle_watch_account(&app2, &acc2);
+                idle_watch_account(&app2, &acc2, stop);
             });
         }
     }
@@ -1206,6 +1227,34 @@ fn spawn_missing_idle_watchers(app: &tauri::AppHandle) {
 enum IdleOutcome {
     /// The server does not advertise IDLE; fall back to slow polling.
     NoIdle,
+    /// The watcher was told to stop (account deleted) mid-cycle.
+    Stopped,
+}
+
+/// True while the named account is still present in the config.
+fn account_configured(app: &tauri::AppHandle, name: &str) -> bool {
+    app.state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .accounts
+        .iter()
+        .any(|a| a.name == name)
+}
+
+/// Unregister a watcher thread, but only if the stop flag registered under
+/// the account name is the one this thread holds: a re-added account gets
+/// a fresh flag, so a winding-down old watcher must not unregister its
+/// replacement.
+fn deregister_watcher(app: &tauri::AppHandle, acc: &AccountConfig, stop: &Arc<AtomicBool>) {
+    let st = app.state::<AppState>();
+    let mut watchers = st.idle_watchers.lock().unwrap();
+    if watchers
+        .get(&acc.name)
+        .is_some_and(|f| Arc::ptr_eq(f, stop))
+    {
+        watchers.remove(&acc.name);
+    }
 }
 
 /// Per-account background watcher: prefers the RFC 2177 IDLE push (one
@@ -1213,29 +1262,33 @@ enum IdleOutcome {
 /// polling), falling back to a slow poll loop for servers without IDLE.
 /// Reconnects with backoff on connection loss; exits if the account is
 /// removed.
-fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig) {
+fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig, stop: Arc<AtomicBool>) {
     let mut backoff = 5u64;
     loop {
-        // Stop if the account was deleted while we were away.
+        // Stop if the account was deleted (or a stop was requested) while
+        // we were away.
         let st = app.state::<AppState>();
         let still_there = {
             let cfg = st.config.lock().unwrap();
             cfg.accounts.iter().any(|a| a.name == acc.name)
         };
-        if !still_there {
+        if stop.load(Ordering::Acquire) || !still_there {
             log::info!("background watcher for {} exiting (account removed)", acc.email);
-            let st = app.state::<AppState>();
-            let mut watched = st.idle_watched.lock().unwrap();
-            watched.remove(&acc.name);
+            deregister_watcher(app, acc, &stop);
             return;
         }
-        match idle_cycle(app, acc) {
+        match idle_cycle(app, acc, &stop) {
             Ok(IdleOutcome::NoIdle) => {
                 log::info!(
                     "{} has no IDLE support; falling back to slow polling",
                     acc.email
                 );
-                slow_poll_account(app, acc);
+                slow_poll_account(app, acc, stop);
+                return;
+            }
+            Ok(IdleOutcome::Stopped) => {
+                // delete_account asked us to stop mid-cycle.
+                deregister_watcher(app, acc, &stop);
                 return;
             }
             Err(e) => {
@@ -1255,9 +1308,17 @@ fn idle_watch_account(app: &tauri::AppHandle, acc: &AccountConfig) {
 /// Fallback for servers without IDLE: a modest interval check (new mail +
 /// offline-flag sync) that keeps notifications working without hammering
 /// the server. The frontend's manual Refresh stays the primary trigger.
-fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig) {
+fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig, stop: Arc<AtomicBool>) {
     loop {
-        std::thread::sleep(Duration::from_secs(15 * 60));
+        // Sleep in one-minute slices so a deleted account stops the poller
+        // promptly instead of lingering for a full 15-minute interval.
+        for _ in 0..15 {
+            if stop.load(Ordering::Acquire) || !account_configured(app, &acc.name) {
+                deregister_watcher(app, acc, &stop);
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        }
         let Some(inbox) = inbox_folder_name(acc) else {
             // Folder listing failed — the server is unreachable.
             let _ = app.emit("connection-lost", ());
@@ -1325,7 +1386,11 @@ fn warm_inbox_cache(acc: &AccountConfig, inbox: &str) {
 /// One IDLE connection lifetime: connect, select the inbox, verify the
 /// server supports IDLE, then idle until the connection drops. Returns
 /// `NoIdle` (fall back to slow polling) or an error to trigger a reconnect.
-fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome, String> {
+fn idle_cycle(
+    app: &tauri::AppHandle,
+    acc: &AccountConfig,
+    stop: &AtomicBool,
+) -> Result<IdleOutcome, String> {
     let Some(inbox) = inbox_folder_name(acc) else {
         return Err("no inbox folder found".into());
     };
@@ -1354,6 +1419,12 @@ fn idle_cycle(app: &tauri::AppHandle, acc: &AccountConfig) -> Result<IdleOutcome
 
     loop {
         use imap::extensions::idle::WaitOutcome;
+        // Exit promptly when the account is deleted: the IDLE wait below
+        // can block for up to IDLE_KEEPALIVE_SECS, so check at every
+        // opportunity between waits.
+        if stop.load(Ordering::Acquire) {
+            return Ok(IdleOutcome::Stopped);
+        }
         // Bind the outcome first so the temporary IDLE handle (which borrows
         // the session mutably) is dropped before we touch the session again.
         // The keepalive timeout is far shorter than the crate default (29
@@ -1394,6 +1465,12 @@ fn process_inbox_change(
     inbox: &str,
     session: &mut imap::Session<Box<dyn imap::ImapConnection>>,
 ) -> Result<(), String> {
+    // The account can be deleted while an IDLE wait is outstanding (the
+    // wait only returns on timeout or a mailbox change). Bail before any
+    // store access so a deleted account's cache is never re-created.
+    if !account_configured(app, &acc.name) {
+        return Ok(());
+    }
     let uids = session
         .uid_search("ALL")
         .map_err(|e| format!("UID SEARCH failed: {e}"))?;
@@ -1472,7 +1549,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             config: Mutex::new(config),
-            idle_watched: Mutex::new(std::collections::HashSet::new()),
+            idle_watchers: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             spawn_missing_idle_watchers(app.handle());
