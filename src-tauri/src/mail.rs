@@ -44,6 +44,9 @@ pub struct MessageBody {
     pub uid: u32,
     pub html: Option<String>,
     pub text: Option<String>,
+    /// Recipient display strings ("Name <email>") — used by Reply All.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
 }
 
 fn imap_session(
@@ -173,6 +176,20 @@ fn address_display(a: &mail_parser::Addr) -> String {
     } else {
         format!("{name} <{email}>")
     }
+}
+
+/// "Name <email>" display strings for a message's To/Cc address lists
+/// (both flat lists and named groups).
+fn recipient_list(addr: Option<&mail_parser::Address>) -> Vec<String> {
+    addr.map(|a| match a {
+        mail_parser::Address::List(list) => list.iter().map(address_display).collect(),
+        mail_parser::Address::Group(groups) => groups
+            .iter()
+            .flat_map(|g| g.addresses.iter())
+            .map(address_display)
+            .collect(),
+    })
+    .unwrap_or_default()
 }
 
 /// Extract the message-ids (angle brackets stripped) from a References /
@@ -833,9 +850,11 @@ pub async fn fetch_message_full(
         let msg = MessageParser::default().parse(raw).ok_or("unparseable message")?;
         let html = msg.body_html(0).map(|b| b.to_string());
         let text = msg.body_text(0).map(|b| b.to_string());
+        let to = recipient_list(msg.to());
+        let cc = recipient_list(msg.cc());
         let attachments = store::extract_attachments(raw);
         Ok(FetchedMessage {
-            body: MessageBody { uid, html, text },
+            body: MessageBody { uid, html, text, to, cc },
             attachments,
         })
     })
@@ -1075,6 +1094,7 @@ pub fn content_type_for(filename: &str) -> lettre::message::header::ContentType 
 pub async fn send_email(
     acc: &AccountConfig,
     to: Vec<String>,
+    cc: Vec<String>,
     subject: &str,
     body: &str,
     attachments: Vec<String>,
@@ -1092,6 +1112,10 @@ pub async fn send_email(
     for t in &to {
         let m: Mailbox = t.parse().map_err(|e| format!("bad to address '{t}': {e}"))?;
         builder = builder.to(m);
+    }
+    for c in &cc {
+        let m: Mailbox = c.parse().map_err(|e| format!("bad cc address '{c}': {e}"))?;
+        builder = builder.cc(m);
     }
     // Threading headers: wrap bare message-ids in angle brackets as RFC
     // 5322 requires (the stored ids are bracket-less).

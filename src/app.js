@@ -32,6 +32,9 @@ const state = {
   selectedUid: null,
   sidebarVisible: loadSidebarVisible(localStorage),
   online: true,
+  // Full-text search over the local cache; null = not searching, an array
+  // = search hits shown in place of the folder's message list.
+  searchResults: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -104,12 +107,7 @@ async function loadFolders() {
 function setOnlineStatus(online) {
   const wasOffline = state.online === false;
   state.online = online;
-  const label = $("account-label");
-  const base = state.account
-    ? `${state.account.name} — ${state.account.email}`
-    : "No accounts configured — use Accounts → Add account";
-  label.textContent = online ? base : `${base}  ·  ~offline`;
-  label.classList.toggle("offline", !online);
+  updateAccountsButton();
 
   if (online) {
     clearStatus();
@@ -220,6 +218,8 @@ function renderFolders() {
 }
 
 async function selectFolder(name) {
+  // Opening a folder leaves search mode (results were spanning all folders).
+  if (state.searchResults !== null) exitSearch();
   state.folder = name;
   state.selectedUid = null;
   renderFolders();
@@ -251,6 +251,9 @@ function hideListLoading() {
 
 async function loadMessages() {
   if (!state.account || !state.folder) return;
+  // Search results replace the folder's message list; don't clobber them
+  // on a background refresh while the user is looking at search hits.
+  if (state.searchResults !== null) return;
   const folderAtStart = state.folder;
   showListLoading(`Loading ${state.folder}…`);
   state.messages = [];
@@ -334,7 +337,155 @@ function groupThreads(messages) {
   return threads;
 }
 
+/* ---------- search ---------- */
+
+let searchTimer = null;
+
+// Toggle the toolbar search box: clicking the icon opens/focuses it, a
+// second click (or Esc / ✕) closes it and restores the folder list.
+function toggleSearch() {
+  const box = $("search-box");
+  if (box.classList.contains("active")) {
+    exitSearch();
+  } else {
+    box.classList.add("active");
+    $("search-input").value = "";
+    $("search-input").focus();
+  }
+}
+
+// Close the search box and drop the results (idempotent).
+function exitSearch() {
+  const hadResults = state.searchResults !== null;
+  clearTimeout(searchTimer);
+  state.searchResults = null;
+  $("search-input").value = "";
+  $("search-box").classList.remove("active");
+  if (hadResults) renderMessages();
+}
+
+function onSearchInput() {
+  clearTimeout(searchTimer);
+  const q = $("search-input").value;
+  searchTimer = setTimeout(() => runSearch(q), 250);
+}
+
+// Run a search over every cached message in every folder (backend searches
+// all accounts' caches). Empty query leaves search mode.
+async function runSearch(query) {
+  const q = query.trim();
+  if (!q) {
+    state.searchResults = null;
+    renderMessages();
+    return;
+  }
+  state.searchResults = []; // show "Searching…"
+  renderSearchResults();
+  try {
+    const results = await invoke("search_messages", { query: q });
+    if ($("search-input").value.trim() !== q) return; // stale keystroke
+    state.searchResults = results;
+    renderSearchResults();
+  } catch (e) {
+    state.searchResults = null;
+    showError(String(e));
+  }
+}
+
+// Render search hits in the message list pane: folder badge + subject,
+// sender, date and snippet. Clicking a hit opens that message.
+function renderSearchResults() {
+  const ul = $("message-list");
+  const results = state.searchResults;
+  ul.innerHTML = "";
+  if (!results || results.length === 0) {
+    const li = document.createElement("li");
+    li.className = "search-empty";
+    li.textContent = results ? "No messages found" : "Searching…";
+    ul.appendChild(li);
+    return;
+  }
+  for (const r of results) {
+    const li = document.createElement("li");
+    li.className = (r.seen ? "read" : "unread") + " search-result";
+
+    const top = document.createElement("div");
+    top.className = "msg-top";
+    const from = document.createElement("span");
+    from.className = "msg-from";
+    from.textContent = r.from || "(unknown)";
+    const folder = document.createElement("span");
+    folder.className = "msg-folder";
+    folder.textContent = r.folder;
+    const date = document.createElement("span");
+    date.className = "msg-date";
+    date.textContent = fmtDate(r.date);
+    top.append(from, folder, date);
+
+    const subj = document.createElement("div");
+    subj.className = "msg-subject";
+    subj.textContent = stripSubjectPrefixes(r.subject) || "(no subject)";
+    li.append(top, subj);
+    if (r.snippet) {
+      const snippet = document.createElement("div");
+      snippet.className = "msg-snippet";
+      snippet.textContent = r.snippet;
+      li.appendChild(snippet);
+    }
+
+    li.addEventListener("click", () => openSearchResult(r));
+    ul.appendChild(li);
+  }
+}
+
+// Open a search hit: switch to its account + folder and show the message
+// (fetched directly, so hits older than the folder's visible window open
+// too), then mark it read.
+async function openSearchResult(r) {
+  exitSearch();
+  if (state.account && state.account.name !== r.account) {
+    await switchAccount(r.account);
+  }
+  // Remember the hit as this folder's selection BEFORE loading it, so the
+  // folder restore after selectFolder picks it up (when it is inside the
+  // visible window).
+  saveSelection(localStorage, r.account, r.folder, r.uid);
+  if (state.folder !== r.folder) {
+    await selectFolder(r.folder);
+  }
+  state.selectedUid = r.uid;
+  saveSelection(localStorage, state.account.name, r.folder, r.uid);
+  $("preview-empty").classList.add("hidden");
+  $("preview-content").classList.remove("hidden");
+  const synthetic = {
+    uid: r.uid,
+    subject: r.subject,
+    from: r.from,
+    date: r.date,
+    seen: r.seen,
+    has_attachment: false,
+    snippet: r.snippet,
+    message_id: "",
+    references: "",
+    in_reply_to: "",
+    thread_id: "search:" + r.uid,
+  };
+  await renderThread(
+    $("preview-subject"),
+    $("preview-meta"),
+    $("preview-thread"),
+    [synthetic]
+  );
+  if (!r.seen) setSeen(r.uid, true);
+}
+
 function renderMessages() {
+  // While a search is active the list shows hits from every folder instead
+  // of the current folder's messages.
+  if (state.searchResults !== null) {
+    renderSearchResults();
+    return;
+  }
   const ul = $("message-list");
   ul.innerHTML = "";
   for (const thread of groupThreads(state.messages)) {
@@ -973,28 +1124,170 @@ function renderComposeAttachments() {
   }
 }
 
-function openCompose(replyTo) {
+// Open the compose dialog. mode: "reply" (default), "reply-all" or
+// "forward"; `extra` is the fetched message body (to/cc for Reply All,
+// plain text for the forward quote) when available.
+function openCompose(replyTo, mode = "reply", extra = null) {
   const dlg = $("compose-dialog");
   $("compose-error").classList.add("hidden");
   composeAttachments = [];
   renderComposeAttachments();
-  if (replyTo) {
+  if (!replyTo) {
+    composeReplyContext = null;
+    $("compose-to").value = "";
+    $("compose-cc").value = "";
+    $("compose-subject").value = "";
+    $("compose-body").value = "";
+    dlg.showModal();
+    return;
+  }
+  const subject = replyTo.subject || "";
+  if (mode === "forward") {
+    composeReplyContext = null;
+    $("compose-to").value = "";
+    $("compose-cc").value = "";
+    $("compose-subject").value = /^fwd:/i.test(subject)
+      ? subject
+      : "Fwd: " + subject;
+    $("compose-body").value = quoteOriginal(replyTo, extra);
+  } else {
     composeReplyContext = {
       inReplyTo: replyTo.message_id || null,
       references: replyTo.references || null,
     };
-    $("compose-to").value = replyTo.from || "";
-    $("compose-subject").value = replyTo.subject.startsWith("Re:")
-      ? replyTo.subject
-      : "Re: " + replyTo.subject;
-    $("compose-body").value = `\n\n----- Original message -----\nFrom: ${replyTo.from}\nSubject: ${replyTo.subject}\n`;
-  } else {
-    composeReplyContext = null;
-    $("compose-to").value = "";
-    $("compose-subject").value = "";
-    $("compose-body").value = "";
+    if (mode === "reply-all") {
+      // Reply All: sender + original To in the To field, and the original
+      // Cc recipients stay in the Cc field.
+      $("compose-to").value = replyToAddresses(replyTo, extra);
+      $("compose-cc").value = replyCcAddresses(extra);
+    } else {
+      $("compose-to").value = replyTo.from || "";
+      $("compose-cc").value = "";
+    }
+    $("compose-subject").value = /^re:/i.test(subject) ? subject : "Re: " + subject;
+    $("compose-body").value = quoteOriginal(replyTo, extra);
   }
   dlg.showModal();
+}
+
+// "----- Original message -----" header block (plus the quoted text when
+// the body was fetched) for reply / reply-all / forward bodies.
+function quoteOriginal(replyTo, extra) {
+  const lines = [
+    "\n\n----- Original message -----",
+    `From: ${replyTo.from || "(unknown)"}`,
+    `Subject: ${replyTo.subject || "(no subject)"}`,
+  ];
+  if (replyTo.date) lines.push(`Date: ${new Date(replyTo.date).toLocaleString()}`);
+  if (extra && extra.text) {
+    lines.push("");
+    lines.push(extra.text.split("\n").map((l) => "> " + l).join("\n"));
+  }
+  return lines.join("\n");
+}
+
+// Addresses (minus the current account, deduplicated) for Reply All.
+function filterAddresses(list) {
+  const self = (state.account ? state.account.email : "").toLowerCase();
+  const seen = new Set();
+  const out = [];
+  for (const a of list || []) {
+    const s = String(a || "").trim();
+    if (!s || seen.has(s.toLowerCase())) continue;
+    if (self && s.toLowerCase().includes(self)) continue;
+    seen.add(s.toLowerCase());
+    out.push(s);
+  }
+  return out;
+}
+
+// Reply All To field: sender + the original To list, minus self.
+function replyToAddresses(replyTo, extra) {
+  return filterAddresses([replyTo.from, ...((extra && extra.to) || [])]).join(", ");
+}
+
+// Reply All Cc field: the original Cc list, minus self.
+function replyCcAddresses(extra) {
+  return filterAddresses((extra && extra.cc) || []).join(", ");
+}
+
+// Fetch the message body (recipients for Reply All, text for the forward
+// quote) and open compose in the requested mode.
+async function openComposeMode(msg, mode) {
+  let extra = null;
+  if (mode !== "reply") {
+    try {
+      extra = await invoke("fetch_message", {
+        account: state.account.name,
+        folder: state.folder,
+        uid: msg.uid,
+      });
+    } catch (_) {
+      // Offline / not cached: reply-all degrades to the sender only.
+    }
+  }
+  openCompose(msg, mode, extra);
+}
+
+// The dropdown under the Reply caret: Reply / Reply All / Forward.
+function showReplyMenu(anchor, msg) {
+  let menu = document.getElementById("reply-menu");
+  if (!menu) {
+    menu = document.createElement("div");
+    menu.id = "reply-menu";
+    menu.className = "reply-menu";
+    document.body.appendChild(menu);
+  }
+  menu.innerHTML = "";
+  const items = [
+    { label: "Reply", mode: "reply" },
+    { label: "Reply all", mode: "reply-all" },
+    { label: "Forward", mode: "forward" },
+  ];
+  for (const it of items) {
+    const el = document.createElement("div");
+    el.className = "menu-item";
+    el.textContent = it.label;
+    el.addEventListener("click", () => {
+      closeReplyMenu();
+      openComposeMode(msg, it.mode);
+    });
+    menu.appendChild(el);
+  }
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = rect.left + "px";
+  menu.style.top = rect.bottom + 2 + "px";
+
+  const close = (e) => {
+    if (!menu.contains(e.target)) {
+      closeReplyMenu();
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+    }
+  };
+  setTimeout(() => {
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+  }, 0);
+}
+
+function closeReplyMenu() {
+  const menu = document.getElementById("reply-menu");
+  if (menu) menu.remove();
+}
+
+// Wire a split Reply control: the main part replies, the caret opens the
+// Reply / Reply All / Forward dropdown.
+function attachReplySplit(mainBtn, caretBtn, getMsg) {
+  mainBtn.addEventListener("click", () => {
+    const m = getMsg();
+    if (m) openCompose(m, "reply");
+  });
+  caretBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const m = getMsg();
+    if (m) showReplyMenu(caretBtn, m);
+  });
 }
 
 let sendStatusTimer = null;
@@ -1020,6 +1313,10 @@ async function sendCompose(e) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  const cc = $("compose-cc").value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const subject = $("compose-subject").value;
   const body = $("compose-body").value;
 
@@ -1032,6 +1329,7 @@ async function sendCompose(e) {
       args: {
         account: state.account.name,
         to,
+        cc,
         subject,
         body,
         attachments: composeAttachments,
@@ -1111,15 +1409,27 @@ async function refreshAccounts(preferredName) {
     null;
   state.account = target;
   renderAccountsMenu();
-  updateAccountLabel();
+  updateAccountsButton();
   renderEmptyStates();
   await resetMailState();
 }
 
-function updateAccountLabel() {
-  $("account-label").textContent = state.account
-    ? `${state.account.name} — ${state.account.email}`
-    : "No accounts configured — use Accounts → Add account";
+// The Accounts button doubles as the current-account badge: it shows the
+// selected account's email (with a ·~offline marker while disconnected), and
+// reverts to plain "Accounts" when no account is configured.
+function updateAccountsButton() {
+  const btn = $("accounts-btn");
+  const acc = state.account;
+  if (!acc) {
+    btn.textContent = "Accounts ▾";
+    btn.classList.remove("offline");
+    btn.title = "No account configured — use this menu to add one";
+    return;
+  }
+  const offline = !state.online;
+  btn.textContent = offline ? `${acc.email} · ~offline ▾` : `${acc.email} ▾`;
+  btn.classList.toggle("offline", offline);
+  btn.title = `Account: ${acc.name} (${acc.email})`;
 }
 
 function renderEmptyStates() {
@@ -1135,7 +1445,7 @@ async function switchAccount(name) {
   if (!acc) return;
   state.account = acc;
   renderAccountsMenu();
-  updateAccountLabel();
+  updateAccountsButton();
   renderEmptyStates();
   await resetMailState();
 }
@@ -1515,16 +1825,36 @@ function init() {
   // Full manual refresh: folders (badges) + the visible message list.
   $("refresh-btn").addEventListener("click", refreshMail);
 
+  // Search: toolbar icon toggles an expanding input; typing searches every
+  // cached folder; Esc / ✕ closes. Ctrl+K focuses search from anywhere.
+  $("search-btn").addEventListener("click", toggleSearch);
+  $("search-clear").addEventListener("click", exitSearch);
+  $("search-input").addEventListener("input", onSearchInput);
+  $("search-input").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      exitSearch();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      clearTimeout(searchTimer);
+      runSearch($("search-input").value);
+    }
+  });
+
   initMailRefreshListener();
   initFrameSizing();
   $("compose-btn").addEventListener("click", () => openCompose(null));
   $("compose-attach").addEventListener("click", attachFiles);
   document.getElementById("compose-form").addEventListener("submit", sendCompose);
   $("compose-cancel").addEventListener("click", () => $("compose-dialog").close());
-  $("reply-btn").addEventListener("click", () => {
-    const m = state.messages.find((x) => x.uid === state.selectedUid);
-    if (m) openCompose(m);
-  });
+  // Reply split control (preview + modal): main part replies, the caret
+  // opens the Reply / Reply All / Forward dropdown.
+  attachReplySplit($("reply-btn"), $("reply-more"), () =>
+    state.messages.find((x) => x.uid === state.selectedUid)
+  );
+  attachReplySplit($("modal-reply"), $("modal-reply-more"), () =>
+    state.messages.find((x) => x.uid === modalUid)
+  );
   $("delete-btn").addEventListener("click", () => {
     if (state.selectedUid != null) deleteMessage(state.selectedUid);
   });
@@ -1535,10 +1865,6 @@ function init() {
 
   // Full-width message modal.
   $("modal-close").addEventListener("click", closeMessageModal);
-  $("modal-reply").addEventListener("click", () => {
-    const m = state.messages.find((x) => x.uid === modalUid);
-    if (m) openCompose(m);
-  });
   $("modal-move").addEventListener("click", () => {
     if (modalUid != null) openMoveDialog(modalUid);
   });
@@ -1568,6 +1894,11 @@ function init() {
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key === "b") toggleSidebar();
     if (e.ctrlKey && e.key === "n") openCompose(null);
+    if (e.ctrlKey && e.key === "k") {
+      e.preventDefault();
+      if (!$("search-box").classList.contains("active")) toggleSearch();
+      else $("search-input").focus();
+    }
   });
 
   refreshAccounts(null)

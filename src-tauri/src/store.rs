@@ -185,6 +185,11 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE attachments ADD COLUMN content_id TEXT;",
         );
+        // Recipient lists for Reply All (JSON in a TEXT column; NULL until
+        // the first server fetch of a message).
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN recipients TEXT;",
+        );
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_folder_thread ON messages(folder, thread_id);",
         );
@@ -382,6 +387,52 @@ impl Store {
         Ok(out)
     }
 
+    /// Search every cached message in every folder — subject, sender name,
+    /// sender address and plain-text body — with all terms AND-ed
+    /// (case-insensitive via SQLite LIKE). Newest first, capped at 200.
+    pub fn search_all(&self, terms: &[String]) -> Result<Vec<SearchHit>, String> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT folder, uid, COALESCE(subject,''), COALESCE(from_name,''), \
+             COALESCE(from_email,''), date, COALESCE(snippet,''), seen \
+             FROM messages WHERE ",
+        );
+        let mut params: Vec<String> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        for term in terms {
+            clauses.push(
+                "(subject LIKE ? ESCAPE '\\' OR from_name LIKE ? ESCAPE '\\' \
+                 OR from_email LIKE ? ESCAPE '\\' OR body_text LIKE ? ESCAPE '\\')"
+                    .to_string(),
+            );
+            let pattern = like_pattern(term);
+            for _ in 0..4 {
+                params.push(pattern.clone());
+            }
+        }
+        sql.push_str(&clauses.join(" AND "));
+        sql.push_str(" ORDER BY date DESC LIMIT 200");
+
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter().map(|s| s.as_str())), |r| {
+                let ts: Option<i64> = r.get(5)?;
+                Ok(SearchHit {
+                    folder: r.get(0)?,
+                    uid: r.get::<_, i64>(1)? as u32,
+                    subject: r.get(2)?,
+                    from: combine_from(r.get(3)?, r.get(4)?),
+                    date: ts.map(|t| chrono::DateTime::from_timestamp(t, 0)).flatten(),
+                    snippet: r.get(6)?,
+                    seen: r.get::<_, i64>(7)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
     /// One cached summary by folder+uid, including rows under an in-flight
     /// optimistic delete (they are hidden from load_summaries). Used to
     /// relocate a deleted message's row to Trash once the server move
@@ -523,6 +574,59 @@ impl Store {
                     other => Ok(Some(other)),
                 }
             }
+        }
+    }
+
+    /// Remember a message's recipients (used by Reply All), stored as JSON
+    /// in the `recipients` column. Missing until the first server fetch of
+    /// the message — the cache warm-up path stores bodies only.
+    pub fn store_recipients(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        to: &[String],
+        cc: &[String],
+    ) -> Result<(), String> {
+        let json = serde_json::json!({ "to": to, "cc": cc }).to_string();
+        self.conn
+            .execute(
+                "UPDATE messages SET recipients = ?1 WHERE folder = ?2 AND uid = ?3",
+                rusqlite::params![json, folder, uid],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The stored (to, cc) recipient lists of a message, if any.
+    pub fn load_recipients(
+        &self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<(Vec<String>, Vec<String>)>, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT recipients FROM messages WHERE folder = ?1 AND uid = ?2",
+                rusqlite::params![folder, uid],
+                |r| r.get(0),
+            )
+            .ok();
+        match raw {
+            Some(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                let list = |key: &str| -> Vec<String> {
+                    v.get(key)
+                        .and_then(|x| x.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                Ok(Some((list("to"), list("cc"))))
+            }
+            None => Ok(None),
         }
     }
 
@@ -1239,6 +1343,39 @@ fn combine_from(name: String, email: String) -> String {
     } else {
         format!("{name} <{email}>")
     }
+}
+
+// ------------------------------------------------------------ full-text search
+
+/// A single full-text search hit over the local cache.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub folder: String,
+    pub uid: u32,
+    pub subject: String,
+    pub from: String,
+    pub date: Option<chrono::DateTime<chrono::Utc>>,
+    pub snippet: String,
+    pub seen: bool,
+}
+
+/// A search hit prefixed with the account it came from (searches span
+/// accounts, each of which has its own cache database).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchResult {
+    pub account: String,
+    #[serde(flatten)]
+    pub hit: SearchHit,
+}
+
+/// Escape SQLite LIKE wildcards so a literal `%`/`_` in the query matches
+/// itself, and wrap the term in `%…%` for substring matching.
+fn like_pattern(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
 }
 
 /// Extract attachment metadata while parsing a raw message.

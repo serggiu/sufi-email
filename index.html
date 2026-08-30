@@ -11,22 +11,29 @@
 
       <div id="toolbar">
         <button id="toggle-sidebar" title="Show/hide folders (Ctrl+B)">☰</button>
+        <div id="refresh-wrap">
+          <button id="refresh-btn" title="Refresh now">⟳</button>
+        </div>
         <div id="accounts-menu-wrap">
           <button id="accounts-btn">Accounts ▾</button>
           <div id="accounts-menu" class="hidden"></div>
         </div>
-        <span id="account-label"></span>
+        <div id="search-wrap">
+          <button id="search-btn" title="Search messages (Ctrl+K)">
+            <svg xmlns="http://www.w3.org/2000/svg" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          </button>
+          <div id="search-box">
+            <input id="search-input" type="text" placeholder="Search all mail…" spellcheck="false" />
+            <button id="search-clear" title="Clear search (Esc)">✕</button>
+          </div>
+        </div>
         <span id="send-status" class="hidden"></span>
         <span class="spacer"></span>
+        <button id="compose-btn" title="Compose (Ctrl+N)">✎</button>
         <div id="font-controls">
           <button id="font-dec" title="Decrease font size">A−</button>
           <button id="font-inc" title="Increase font size">A+</button>
         </div>
-        <span id="send-status" class="hidden"></span>
-        <div id="refresh-wrap">
-          <button id="refresh-btn" title="Refresh now">⟳ Refresh</button>
-        </div>
-        <button id="compose-btn" title="Compose (Ctrl+N)">✎ Compose</button>
       </div>
 
       <div id="main">
@@ -56,9 +63,14 @@
             <div id="preview-subject"></div>
             <div id="preview-meta"></div>
             <div id="preview-actions">
-              <button id="reply-btn">↩ Reply</button>
-              <button id="move-btn">→ Move</button>
-              <button id="delete-btn" class="danger">✕ Delete</button>
+              <div class="reply-split">
+                <button id="reply-btn">↩ Reply</button>
+                <button id="reply-more" class="reply-caret" title="Reply all or forward" aria-label="More reply options">▾</button>
+              </div>
+              <div class="action-group">
+                <button id="move-btn">→ Move</button>
+                <button id="delete-btn" class="danger">✕ Delete</button>
+              </div>
             </div>
             <div id="preview-thread"></div>
           </div>
@@ -126,9 +138,14 @@
         </div>
         <div id="modal-meta"></div>
         <div id="modal-actions">
-          <button id="modal-reply">↩ Reply</button>
-          <button id="modal-move">→ Move</button>
-          <button id="modal-delete" class="danger">✕ Delete</button>
+          <div class="reply-split">
+            <button id="modal-reply">↩ Reply</button>
+            <button id="modal-reply-more" class="reply-caret" title="Reply all or forward" aria-label="More reply options">▾</button>
+          </div>
+          <div class="action-group">
+            <button id="modal-move">→ Move</button>
+            <button id="modal-delete" class="danger">✕ Delete</button>
+          </div>
         </div>
         <div id="modal-thread"></div>
       </dialog>
@@ -148,6 +165,7 @@
         <form id="compose-form" method="dialog">
           <h2>New message</h2>
           <label>To <input id="compose-to" type="text" placeholder="a@b.com, c@d.com" required /></label>
+          <label>Cc <input id="compose-cc" type="text" placeholder="b@example.com (optional)" /></label>
           <label>Subject <input id="compose-subject" type="text" required /></label>
           <textarea id="compose-body" rows="12" placeholder="Write your message…"></textarea>
           <div id="compose-attachments"></div>

@@ -186,6 +186,89 @@ fn set_seen_updates_only_target_row() {
 }
 
 #[test]
+fn search_finds_messages_across_folders_by_subject_from_and_body() {
+    let (_dir, mut store) = test_store("search");
+    store
+        .upsert_summaries(
+            "INBOX",
+            &[summary(1, "Project kickoff", "alice@corp.com", 2, false)],
+        )
+        .unwrap();
+    store
+        .upsert_summaries(
+            "Archive",
+            &[summary(2, "Weekly report", "bob@corp.com", 1, true)],
+        )
+        .unwrap();
+    // Body text is stored separately from the summary.
+    store
+        .store_body("INBOX", 1, Some("the quarterly budget review"), None, &[])
+        .unwrap();
+    store
+        .store_body("Archive", 2, Some("nothing to see here"), None, &[])
+        .unwrap();
+
+    // Body matching.
+    let hits = store.search_all(&["budget".to_string()]).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].folder, "INBOX");
+    assert_eq!(hits[0].uid, 1);
+    assert_eq!(hits[0].subject, "Project kickoff");
+
+    // Subject and sender matching.
+    let hits = store.search_all(&["report".to_string()]).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].folder, "Archive");
+    let hits = store.search_all(&["alice".to_string()]).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].uid, 1);
+
+    // Multiple terms are AND-ed; case-insensitive.
+    assert!(
+        store
+            .search_all(&["Budget".to_string(), "review".to_string()])
+            .unwrap()
+            .len()
+            == 1
+    );
+    assert!(
+        store
+            .search_all(&["budget".to_string(), "missing".to_string()])
+            .unwrap()
+            .is_empty()
+    );
+
+    // Empty terms return nothing.
+    assert!(store.search_all(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn recipients_round_trip_through_the_cache() {
+    let (_dir, mut store) = test_store("recipients");
+    store
+        .upsert_summaries("INBOX", &[summary(1, "Hello", "a@b.com", 1, false)])
+        .unwrap();
+
+    // Unknown until the first server fetch stores them.
+    assert!(store.load_recipients("INBOX", 1).unwrap().is_none());
+
+    store
+        .store_recipients(
+            "INBOX",
+            1,
+            &["Alice <a@b.com>".to_string()],
+            &["Bob <b@c.com>".to_string()],
+        )
+        .unwrap();
+    let (to, cc) = store
+        .load_recipients("INBOX", 1)
+        .unwrap()
+        .expect("recipients stored");
+    assert_eq!(to, vec!["Alice <a@b.com>"]);
+    assert_eq!(cc, vec!["Bob <b@c.com>"]);
+}
+
+#[test]
 fn delete_message_removes_row_and_attachments() {
     let (_dir, mut store) = test_store("delete");
     store

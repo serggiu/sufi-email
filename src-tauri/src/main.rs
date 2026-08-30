@@ -595,16 +595,20 @@ async fn fetch_message(
     };
     let acc = cfg.ok_or_else(|| format!("unknown account '{account}'"))?;
 
-    // Serve from cache when we already have the body.
+    // Serve from cache when we already have the body AND its recipients
+    // (the cache warm-up path stores bodies without recipients; the first
+    // server fetch fills them in for Reply All).
     {
         let store = store::Store::open(&acc)?;
         if let Some((text, html)) = store.load_body(&folder, uid)? {
-            return Ok(mail::MessageBody { uid, text, html });
+            if let Some((to, cc)) = store.load_recipients(&folder, uid)? {
+                return Ok(mail::MessageBody { uid, text, html, to, cc });
+            }
         }
     }
 
-    // Not cached: fetch body + attachment metadata in a single connection,
-    // then persist both so the next open is served from the cache.
+    // Not cached (or recipients unknown): fetch the full message, then
+    // persist both the body and the recipients.
     let fetched = mail::fetch_message_full(&acc, &folder, uid).await?;
     let mut store = store::Store::open(&acc)?;
     store.store_body(
@@ -614,6 +618,7 @@ async fn fetch_message(
         fetched.body.html.as_deref(),
         &fetched.attachments,
     )?;
+    store.store_recipients(&folder, uid, &fetched.body.to, &fetched.body.cc)?;
     Ok(fetched.body)
 }
 
@@ -818,6 +823,8 @@ async fn list_attachments(
 struct SendArgs {
     account: String,
     to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
     subject: String,
     body: String,
     #[serde(default)]
@@ -840,6 +847,7 @@ async fn send_email(args: SendArgs, state: State<'_, AppState>) -> Result<(), St
     mail::send_email(
         &acc,
         args.to,
+        args.cc,
         &args.subject,
         &args.body,
         args.attachments,
@@ -847,6 +855,40 @@ async fn send_email(args: SendArgs, state: State<'_, AppState>) -> Result<(), St
         args.references,
     )
     .await
+}
+
+/// Search every account's local cache (all folders) for messages matching
+/// all of the query's whitespace-separated terms. Pure local search: subject,
+/// sender and plain-text body. Newest first, capped at 200.
+#[tauri::command]
+async fn search_messages(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<store::SearchResult>, String> {
+    let accounts = state.config.lock().unwrap().accounts.clone();
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for acc in &accounts {
+            if let Ok(store) = store::Store::open(acc) {
+                if let Ok(hits) = store.search_all(&terms) {
+                    out.extend(hits.into_iter().map(|hit| store::SearchResult {
+                        account: acc.name.clone(),
+                        hit,
+                    }));
+                }
+            }
+        }
+        out.sort_by(|a, b| b.hit.date.cmp(&a.hit.date));
+        out.truncate(200);
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
 }
 
 /// All cached messages of one conversation, newest first.
@@ -1485,7 +1527,8 @@ fn main() {
             get_thread,
             get_attachments_data,
             send_email,
-            theme::get_system_theme
+            theme::get_system_theme,
+            search_messages
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1600,6 +1643,7 @@ mod manual_send_tests {
         block_on(crate::mail::send_email(
             acc,
             vec![to.clone()],
+            Vec::new(), // no Cc
             "sufi-email send test",
             "hello from the manual send test",
             Vec::new(),
