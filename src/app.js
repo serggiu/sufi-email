@@ -22,11 +22,11 @@ import {
   EMAIL_FRAME_SANDBOX,
 } from "./lib/mailview.js";
 import { omarchyThemeToCssVars, applyThemeVars, THEME_VAR_NAMES } from "./lib/theme.js";
+import { shouldHandleFrameLoad, emailLinkUrlFromMessage, hrefFromEmailClick } from "./lib/links.js";
 import {
-  shouldHandleFrameLoad,
-  emailLinkUrlFromMessage,
-  hrefFromEmailClick,
-} from "./lib/links.js";
+  remoteImagesAllowed,
+  buildRemoteImageBar,
+} from "./lib/remote-images.js";
 
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : null;
 
@@ -910,74 +910,24 @@ function renderBlockAttachments(box, uid, atts, thumbParts, dataByPart) {
   }
 }
 
-// Remote-image consent. Blocked by default (the email CSP forbids all
-// network, so tracking pixels cannot phone home); the per-message banner
-// offers two opt-ins, both persisted locally:
-//  - "Load images": just this message (keyed by account/folder/uid).
-//  - "Always load images": every message, from now on.
-const REMOTE_IMAGES_ALWAYS_KEY = "sufi-remote-images-always";
-const remoteImagesAlways = () => {
-  try {
-    return localStorage.getItem(REMOTE_IMAGES_ALWAYS_KEY) === "1";
-  } catch (_) {
-    return false;
-  }
-};
-const remoteImagesKey = (uid) =>
-  `sufi-remote-images:${state.account.name}:${state.folder}:${uid}`;
-const remoteImagesAllowed = (uid) =>
-  remoteImagesAlways() ||
-  (() => {
-    try {
-      return localStorage.getItem(remoteImagesKey(uid)) === "1";
-    } catch (_) {
-      return false;
-    }
-  })();
-const rememberRemoteImages = (uid) => {
-  try {
-    localStorage.setItem(remoteImagesKey(uid), "1");
-  } catch (_) {}
-};
-const rememberRemoteImagesAlways = () => {
-  try {
-    localStorage.setItem(REMOTE_IMAGES_ALWAYS_KEY, "1");
-  } catch (_) {}
-};
-
 // The opt-in banner shown above a message body whose remote images are
 // blocked: explains WHY images are hidden, with per-message and global
 // ways to load them. Either click re-renders the frame with the relaxed
-// CSP and the real URLs restored (no placeholders).
+// CSP and the real URLs restored (no placeholders). The consent logic and
+// bar DOM live in ./lib/remote-images.js (unit-tested); this is the app
+// glue: the re-render itself.
 function renderRemoteImageBar(block, frame, html, uid) {
-  const bar = document.createElement("div");
-  bar.className = "remote-bar";
-  const note = document.createElement("span");
-  note.className = "remote-bar-note";
-  note.textContent = "Remote images are blocked to protect your privacy.";
-  const loadBtn = document.createElement("button");
-  loadBtn.className = "remote-bar-btn";
-  loadBtn.textContent = "Load images";
-  const alwaysBtn = document.createElement("button");
-  alwaysBtn.className = "remote-bar-btn";
-  alwaysBtn.textContent = "Always load images";
-  bar.append(note, loadBtn, alwaysBtn);
-  block.insertBefore(bar, frame);
-  const reload = () => {
-    // The srcdoc swap creates a new message document: let the load handler
-    // attach a fresh ResizeObserver to it, so remote images that decode
-    // late re-measure the frame.
-    frame.__sufiObserved = false;
-    renderViewBody({ frame }, { html }, { remoteImages: true }).catch(() => {});
-    bar.remove();
-  };
-  loadBtn.addEventListener("click", () => {
-    rememberRemoteImages(uid);
-    reload();
-  });
-  alwaysBtn.addEventListener("click", () => {
-    rememberRemoteImagesAlways();
-    reload();
+  buildRemoteImageBar(block, frame, uid, {
+    storage: localStorage,
+    accountName: state.account.name,
+    folder: state.folder,
+    render: () => {
+      // The srcdoc swap creates a new message document: let the load
+      // handler attach a fresh ResizeObserver to it, so remote images
+      // that decode late re-measure the frame.
+      frame.__sufiObserved = false;
+      renderViewBody({ frame }, { html }, { remoteImages: true }).catch(() => {});
+    },
   });
 }
 
@@ -1085,7 +1035,9 @@ async function renderThread(subjectEl, metaEl, container, thread) {
       // broken-image icons and offer the opt-in banner. If they HAVE
       // opted in, the relaxed CSP lets the real URLs load.
       const remote = html ? hasRemoteImages(html) : false;
-      const allowRemote = remote && remoteImagesAllowed(m.uid);
+      const allowRemote =
+        remote &&
+        remoteImagesAllowed(localStorage, state.account.name, state.folder, m.uid);
       let renderHtml = html;
       if (remote && !allowRemote) {
         renderHtml = placeholderRemoteImages(html);
