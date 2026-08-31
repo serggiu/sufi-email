@@ -975,6 +975,13 @@ async function renderThread(subjectEl, metaEl, container, thread) {
     block.append(head, attsBox, frame);
     container.appendChild(block);
 
+    // Fill the reading area immediately: the frame starts empty and only
+    // gets its real height when the body document finishes loading, so
+    // without this it shows as a ~120px white sliver (its CSS min-height)
+    // while the body is fetched. sizeFrameFromParent re-measures on load
+    // and keeps or grows the height from there.
+    frame.style.height = frameDisplayHeight(0, frameAvailableHeight(frame)) + "px";
+
     // Body + attachment metadata in parallel (attachment listing is
     // best-effort and never blocks the body).
     let body = null;
