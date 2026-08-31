@@ -14,6 +14,8 @@ import {
   rewriteCidImages,
   planAttachmentDisplay,
   cidDataMap,
+  hasRemoteImages,
+  placeholderRemoteImages,
   frameDisplayHeight,
   frameAvailableHeight,
   frameContentHeight,
@@ -908,6 +910,77 @@ function renderBlockAttachments(box, uid, atts, thumbParts, dataByPart) {
   }
 }
 
+// Remote-image consent. Blocked by default (the email CSP forbids all
+// network, so tracking pixels cannot phone home); the per-message banner
+// offers two opt-ins, both persisted locally:
+//  - "Load images": just this message (keyed by account/folder/uid).
+//  - "Always load images": every message, from now on.
+const REMOTE_IMAGES_ALWAYS_KEY = "sufi-remote-images-always";
+const remoteImagesAlways = () => {
+  try {
+    return localStorage.getItem(REMOTE_IMAGES_ALWAYS_KEY) === "1";
+  } catch (_) {
+    return false;
+  }
+};
+const remoteImagesKey = (uid) =>
+  `sufi-remote-images:${state.account.name}:${state.folder}:${uid}`;
+const remoteImagesAllowed = (uid) =>
+  remoteImagesAlways() ||
+  (() => {
+    try {
+      return localStorage.getItem(remoteImagesKey(uid)) === "1";
+    } catch (_) {
+      return false;
+    }
+  })();
+const rememberRemoteImages = (uid) => {
+  try {
+    localStorage.setItem(remoteImagesKey(uid), "1");
+  } catch (_) {}
+};
+const rememberRemoteImagesAlways = () => {
+  try {
+    localStorage.setItem(REMOTE_IMAGES_ALWAYS_KEY, "1");
+  } catch (_) {}
+};
+
+// The opt-in banner shown above a message body whose remote images are
+// blocked: explains WHY images are hidden, with per-message and global
+// ways to load them. Either click re-renders the frame with the relaxed
+// CSP and the real URLs restored (no placeholders).
+function renderRemoteImageBar(block, frame, html, uid) {
+  const bar = document.createElement("div");
+  bar.className = "remote-bar";
+  const note = document.createElement("span");
+  note.className = "remote-bar-note";
+  note.textContent = "Remote images are blocked to protect your privacy.";
+  const loadBtn = document.createElement("button");
+  loadBtn.className = "remote-bar-btn";
+  loadBtn.textContent = "Load images";
+  const alwaysBtn = document.createElement("button");
+  alwaysBtn.className = "remote-bar-btn";
+  alwaysBtn.textContent = "Always load images";
+  bar.append(note, loadBtn, alwaysBtn);
+  block.insertBefore(bar, frame);
+  const reload = () => {
+    // The srcdoc swap creates a new message document: let the load handler
+    // attach a fresh ResizeObserver to it, so remote images that decode
+    // late re-measure the frame.
+    frame.__sufiObserved = false;
+    renderViewBody({ frame }, { html }, { remoteImages: true }).catch(() => {});
+    bar.remove();
+  };
+  loadBtn.addEventListener("click", () => {
+    rememberRemoteImages(uid);
+    reload();
+  });
+  alwaysBtn.addEventListener("click", () => {
+    rememberRemoteImagesAlways();
+    reload();
+  });
+}
+
 async function renderThread(subjectEl, metaEl, container, thread) {
   container.innerHTML = "";
   const newest = thread[0];
@@ -1000,18 +1073,34 @@ async function renderThread(subjectEl, metaEl, container, thread) {
 
     // Rewrite cid: references to data: URLs so embedded images render in
     // the sandboxed iframe (whose CSP only allows data: images).
+    let html = body && body.html;
     if (body && body.html && plan.cidParts.length) {
-      body = {
-        ...body,
-        html: rewriteCidImages(body.html, cidDataMap(plan.cidParts, dataByPart)),
-      };
+      html = rewriteCidImages(body.html, cidDataMap(plan.cidParts, dataByPart));
     }
 
     if (body) {
+      // Remote images are blocked by default (tracking pixels cannot phone
+      // home). If the message references any and the user hasn't opted in
+      // (per-message or globally), render blank placeholders instead of
+      // broken-image icons and offer the opt-in banner. If they HAVE
+      // opted in, the relaxed CSP lets the real URLs load.
+      const remote = html ? hasRemoteImages(html) : false;
+      const allowRemote = remote && remoteImagesAllowed(m.uid);
+      let renderHtml = html;
+      if (remote && !allowRemote) {
+        renderHtml = placeholderRemoteImages(html);
+      }
       try {
-        await renderViewBody({ frame }, body);
+        await renderViewBody(
+          { frame },
+          { ...body, html: renderHtml },
+          { remoteImages: allowRemote }
+        );
       } catch (_) {
         // Unrenderable body: leave the block header, empty body.
+      }
+      if (remote && !allowRemote) {
+        renderRemoteImageBar(block, frame, html, m.uid);
       }
     }
     renderBlockAttachments(attsBox, m.uid, atts, plan.thumbParts, dataByPart);

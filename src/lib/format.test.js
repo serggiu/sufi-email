@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { JSDOM } from "jsdom";
-import { fmtDate, fmtSize, escapeHtml, withEmailCsp, LINK_HANDLER_CODE } from "./format.js";
+import {
+  fmtDate,
+  fmtSize,
+  escapeHtml,
+  withEmailCsp,
+  LINK_HANDLER_CODE,
+  EMAIL_BODY_STYLE,
+} from "./format.js";
 
 describe("fmtSize", () => {
   it("formats bytes", () => {
@@ -42,6 +49,33 @@ describe("withEmailCsp", () => {
     const out = withEmailCsp("<html><head></head></html>");
     expect(out).toContain("img-src data:");
     expect(out).not.toContain("https:");
+  });
+  it("relaxes image/media/font loading only when remote images are opted in", () => {
+    const out = withEmailCsp("<html><head></head><body>hi</body></html>", {
+      remoteImages: true,
+    });
+    expect(out).toContain("img-src * data: blob:");
+    expect(out).toContain("media-src * data: blob:");
+    expect(out).toContain("font-src * data: blob:");
+    // Scripts stay pinned to the nonce, connect stays blocked.
+    expect(out).toMatch(/script-src 'nonce-[0-9a-f]+'/);
+    expect(out).toContain("default-src 'none'");
+    expect(out).not.toContain("connect-src");
+  });
+  it("defaults to the strict policy (no remote images)", () => {
+    const out = withEmailCsp("<html><head></head><body>hi</body></html>");
+    expect(out).toContain("img-src data:");
+    expect(out).not.toContain("img-src *");
+  });
+  it("adds a no-referrer meta so opted-in image loads don't leak the app origin", () => {
+    const out = withEmailCsp("<html><head></head></html>", { remoteImages: true });
+    expect(out).toContain('<meta name="referrer" content="no-referrer">');
+  });
+  it("injects the email-body layout guardrails (images never overflow the pane)", () => {
+    const out = withEmailCsp("<html><head></head><body>hi</body></html>");
+    expect(out).toContain(`<style>${EMAIL_BODY_STYLE}</style>`);
+    expect(EMAIL_BODY_STYLE).toContain("img,video{max-width:100%");
+    expect(EMAIL_BODY_STYLE).toContain("table{max-width:100%}");
   });
   it("allows exactly one nonce'd script: the link handler", () => {
     const out = withEmailCsp("<html><head></head><body>hi</body></html>");

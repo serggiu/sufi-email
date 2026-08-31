@@ -54,12 +54,16 @@ export function planAttachmentDisplay(html, atts, limits = {}) {
 }
 
 // Build the content-id → data: URL map used to rewrite cid: references in
-// the body, from the fetched base64 payloads of the embedded parts.
+// the body, from the fetched base64 payloads of the embedded parts. Keys
+// are lowercased: Content-IDs are compared case-insensitively (headers and
+// HTML references frequently disagree on case, e.g. `Content-ID: Logo@X`
+// vs `src="cid:logo@x"`), matching the normalization cidTokensInHtml and
+// the embedded-part plan already apply.
 export function cidDataMap(cidParts, dataByPart) {
   const map = new Map();
   for (const p of cidParts) {
     const b64 = dataByPart.get(p.part_id);
-    if (b64) map.set(p.contentId, `data:${p.contentType};base64,${b64}`);
+    if (b64) map.set(String(p.contentId).toLowerCase(), `data:${p.contentType};base64,${b64}`);
   }
   return map;
 }
@@ -70,6 +74,13 @@ export function cidDataMap(cidParts, dataByPart) {
 // rewritten to data: URLs) vs. plain attachments that merely happen to carry
 // a Content-ID header — Gmail and Apple Mail add Content-IDs to ordinary
 // attachments too.
+//
+// Covers every place a body can reference an embedded part: src/poster/
+// background attributes, CSS url(cid:...) (inline styles), srcset
+// candidates, and SVG image href/xlink:href. (<object data> is NOT
+// handled: object-src 'none' blocks <object> regardless, so treating it
+// as embedded would hide the part from the thumbnail list without ever
+// rendering it.)
 export function cidTokensInHtml(html) {
   const tokens = new Set();
   const add = (tok) => {
@@ -88,7 +99,167 @@ export function cidTokensInHtml(html) {
     add(cid);
     return m;
   });
+  rewriteMediaTags(html, (attrs) => {
+    for (const [name, value] of attrs) {
+      if (name === "srcset") {
+        for (const url of srcsetCandidateUrls(value)) {
+          const cid = /^cid:(.*)$/i.exec(url.trim());
+          if (cid) add(cid[1]);
+        }
+      } else if (name === "href" || name === "xlink:href") {
+        const cid = /^["']?cid:(.*?)["']?$/i.exec(String(value || "").trim());
+        if (cid) add(cid[1]);
+      }
+    }
+    return attrs;
+  });
   return tokens;
+}
+
+// Parse the attribute list of a media tag into [name, value] pairs
+// (lowercased names, quotes stripped; boolean attributes have value null).
+// Media tags = img, image, source, video, object, embed.
+function parseAttrs(s) {
+  const attrs = [];
+  const re = /([^\s=/>]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const name = m[1];
+    if (name === "/") continue;
+    let value = m[2];
+    if (value) value = value.replace(/^["']|["']$/g, "");
+    attrs.push([name.toLowerCase(), value]);
+  }
+  return attrs;
+}
+
+function serializeAttrs(attrs) {
+  if (!attrs.length) return "";
+  return (
+    " " +
+    attrs
+      .map(([name, value]) =>
+        value == null ? name : `${name}="${String(value).replaceAll('"', "&quot;")}"`
+      )
+      .join(" ")
+  );
+}
+
+// Run fn over the attributes of every media tag in the HTML and re-emit
+// the tags. Used by cid rewriting and remote-image placeholding, where
+// attribute juggling (srcset vs src, svg href, object data) is too
+// fiddly for a single regex. Non-media tags are left untouched.
+function rewriteMediaTags(html, fn) {
+  return html.replace(
+    /<(img|image|source|video|object|embed)\b([^>]*)>/gi,
+    (tag, name, rest) => {
+      const out = fn(parseAttrs(rest), tag);
+      return `<${name}${serializeAttrs(out)}>`;
+    }
+  );
+}
+
+// The candidate URLs of a srcset attribute value (quotes stripped,
+// descriptors like "1x" dropped, in document order).
+function srcsetCandidateUrls(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .split(",")
+    .map((c) => c.trim().split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+// Whether an HTML body references remote (http(s) or protocol-relative)
+// images — src/poster/background attributes, CSS url(...), srcset
+// candidates, and SVG image href. cid: and data: references
+// never count. Used to decide when to offer the "Load remote images"
+// banner.
+export function hasRemoteImages(html) {
+  if (!html) return false;
+  const isRemote = (v) => /^(https?:)?\/\//i.test(String(v || "").trim());
+  let found = false;
+  html.replace(
+    /(src|poster|background)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+    (m, _attr, value) => {
+      if (isRemote(value.replace(/^["']|["']$/g, ""))) found = true;
+      return m;
+    }
+  );
+  html.replace(/url\(\s*["']?((?:https?:)?\/\/[^"')]+)["']?\s*\)/gi, (m) => {
+    found = true;
+    return m;
+  });
+  rewriteMediaTags(html, (attrs) => {
+    for (const [name, value] of attrs) {
+      if (name === "srcset") {
+        if (srcsetCandidateUrls(value).some(isRemote)) found = true;
+      } else if (
+        name === "src" ||
+        name === "poster" ||
+        name === "background" ||
+        name === "href" ||
+        name === "xlink:href"
+      ) {
+        if (isRemote(value)) found = true;
+      }
+    }
+    return attrs;
+  });
+  return found;
+}
+
+// A 1x1 transparent GIF. Remote image references in a message the user
+// has NOT opted to load are rewritten to this, so blocked images render
+// as blank space instead of broken-image icons while the banner explains
+// how to load the real ones.
+const BLANK_GIF = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
+// Replace every remote (http(s) / protocol-relative) image reference in
+// an HTML body with the blank GIF, leaving cid: and data: references
+// untouched. Mirrors hasRemoteImages' coverage. Exported for tests and
+// used by the message view before rendering a body whose remote images
+// are still blocked.
+export function placeholderRemoteImages(html) {
+  const isRemote = (v) => /^(https?:)?\/\//i.test(String(v || "").trim());
+  let out = html.replace(
+    /(src|poster|background)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+    (m, attr, value) => {
+      if (isRemote(value.replace(/^["']|["']$/g, ""))) return `${attr}="${BLANK_GIF}"`;
+      return m;
+    }
+  );
+  out = out.replace(
+    /url\(\s*["']?((?:https?:)?\/\/[^"')]+)["']?\s*\)/gi,
+    () => `url("${BLANK_GIF}")`
+  );
+  out = rewriteMediaTags(out, (attrs) => {
+    const kept = [];
+    for (const [name, value] of attrs) {
+      if (name === "srcset") {
+        // A data: URL breaks srcset's comma grammar, so a remote srcset is
+        // dropped outright — the tag falls back to its src (already
+        // blanked if remote) or its alt text.
+        if (srcsetCandidateUrls(value).some(isRemote)) continue;
+        kept.push([name, value]);
+        continue;
+      }
+      if (
+        (name === "src" ||
+          name === "poster" ||
+          name === "background" ||
+          name === "href" ||
+          name === "xlink:href") &&
+        isRemote(value)
+      ) {
+        kept.push([name, BLANK_GIF]);
+        continue;
+      }
+      kept.push([name, value]);
+    }
+    return kept;
+  });
+  return out;
 }
 
 // Replace `cid:` image references in an HTML email body with data: URLs, so
@@ -98,10 +269,10 @@ export function cidTokensInHtml(html) {
 // part are left untouched.
 export function rewriteCidImages(html, cidMap) {
   const lookup = (cid) => {
-    const key = String(cid || "").trim().replace(/^<+|>+$/g, "");
+    const key = String(cid || "").trim().replace(/^<+|>+$/g, "").toLowerCase();
     return cidMap.get(key) || "";
   };
-  return html
+  let out = html
     .replace(
       /(src|poster|background)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
       (match, attr, value) => {
@@ -115,19 +286,50 @@ export function rewriteCidImages(html, cidMap) {
       const url = lookup(cid);
       return url ? `url("${url}")` : match;
     });
+  // Media-tag attributes regexes cannot reach: srcset (data: URLs don't
+  // survive srcset's comma grammar, so a cid srcset becomes a single
+  // src) and SVG image href/xlink:href.
+  out = rewriteMediaTags(out, (attrs) => {
+    const srcset = attrs.find(([n]) => n === "srcset");
+    if (srcset && srcset[1] && /\bcid:/i.test(srcset[1])) {
+      const first = srcsetCandidateUrls(srcset[1]).find((u) => /^cid:/i.test(u));
+      const url = first ? lookup(first.replace(/^cid:/i, "")) : "";
+      if (url) {
+        // Replace the whole srcset with a single data: src, dropping any
+        // original src so the embedded image wins.
+        return [["src", url], ...attrs.filter(([n]) => n !== "src" && n !== "srcset")];
+      }
+      // Unresolvable cid: drop the srcset so the tag falls back to its
+      // own src (which the pass above already rewrote if it was cid:).
+      return attrs.filter(([n]) => n !== "srcset");
+    }
+    for (const n of ["href", "xlink:href"]) {
+      const a = attrs.find(([x]) => x === n);
+      if (a && a[1] && /^["']?cid:/i.test(String(a[1]).trim())) {
+        const url = lookup(String(a[1]).trim().replace(/^["']?cid:/i, ""));
+        if (url) {
+          return attrs.map(([x, v]) => (x === n ? [x, url] : [x, v]));
+        }
+      }
+    }
+    return attrs;
+  });
+  return out;
 }
 
 // Render inside a sandboxed iframe. The injected CSP meta tag allows exactly
 // one script (the nonce'd link handler, see withEmailCsp) and blocks all
 // network — most importantly remote images, so tracking pixels in HTML mail
 // cannot phone home. The email's own scripts stay dead (no matching nonce).
-export async function renderViewBody(view, body) {
+// opts.remoteImages relaxes the CSP so remote images load — only call it
+// after the user opted in (see the banner flow in app.js).
+export async function renderViewBody(view, body, opts = {}) {
   const content =
     body.html ??
     `<pre style="white-space:pre-wrap;font:14px/1.5 monospace">${escapeHtml(
       body.text ?? "(empty message)"
     )}</pre>`;
-  view.frame.srcdoc = await withEmailCsp(content);
+  view.frame.srcdoc = await withEmailCsp(content, opts);
 }
 
 // The sandbox flags for the email-body iframe. Two flags are required:

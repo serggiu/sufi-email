@@ -7,6 +7,8 @@ import {
   cidTokensInHtml,
   planAttachmentDisplay,
   cidDataMap,
+  hasRemoteImages,
+  placeholderRemoteImages,
   frameDisplayHeight,
   frameAvailableHeight,
   frameContentHeight,
@@ -100,6 +102,14 @@ describe("cidDataMap", () => {
     const map = cidDataMap(parts, new Map([["0", "QUJD"]]));
     expect(map.get("a@x")).toBe("data:image/png;base64,QUJD");
   });
+  it("lowercases map keys so header/reference case mismatches still match", () => {
+    const parts = [{ part_id: "0", contentType: "image/png", contentId: "Logo@X" }];
+    const map = cidDataMap(parts, new Map([["0", "QUJD"]]));
+    // The key is stored lowercased; rewriteCidImages lowercases the
+    // reference before looking up, so `cid:logo@x` still resolves.
+    expect(map.get("logo@x")).toBe("data:image/png;base64,QUJD");
+    expect(map.has("Logo@X")).toBe(false);
+  });
   it("skips parts without fetched data", () => {
     const parts = [{ part_id: "0", contentType: "image/png", contentId: "a@x" }];
     expect(cidDataMap(parts, new Map()).size).toBe(0);
@@ -121,6 +131,19 @@ describe("cidTokensInHtml", () => {
   });
   it("returns an empty set when nothing references cid:", () => {
     expect(cidTokensInHtml("<p>attached images should be displayed inline</p>").size).toBe(0);
+  });
+  it("collects cid tokens from srcset candidates", () => {
+    const tokens = cidTokensInHtml('<img srcset="cid:a@x 1x, cid:b@y 2x">');
+    expect(tokens.has("a@x")).toBe(true);
+    expect(tokens.has("b@y")).toBe(true);
+  });
+  it("collects cid tokens from svg image href", () => {
+    const html = '<svg><image href="cid:svg@x"></image></svg>';
+    const tokens = cidTokensInHtml(html);
+    expect(tokens.has("svg@x")).toBe(true);
+  });
+  it("does not collect cid tokens from ordinary link hrefs", () => {
+    expect(cidTokensInHtml('<a href="cid:mailto@x">x</a>').size).toBe(0);
   });
   it("does not count http image refs", () => {
     const tokens = cidTokensInHtml('<img src="https://x/y.png">');
@@ -158,6 +181,100 @@ describe("rewriteCidImages", () => {
     const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
     expect(rewriteCidImages('<img src="cid:<a@x>">', map)).toBe(
       '<img src="data:image/png;base64,AAA">'
+    );
+  });
+  it("turns a cid: srcset into a single data: src (data URLs break srcset grammar)", () => {
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages('<img srcset="cid:a@x 1x, cid:b@y 2x">', map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+  });
+  it("drops a cid: srcset that has no matching part, falling back to the tag's src", () => {
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    // srcset references an unknown cid; the (cid) src is rewritten normally.
+    expect(rewriteCidImages('<img src="cid:a@x" srcset="cid:nope@x 1x">', map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+  });
+  it("rewrites svg image href / xlink:href cid references", () => {
+    const map = new Map([["svg@x", "data:image/svg+xml;base64,QQ"]]);
+    const html = '<svg><image href="cid:svg@x"></image></svg>';
+    expect(rewriteCidImages(html, map)).toBe(
+      '<svg><image href="data:image/svg+xml;base64,QQ"></image></svg>'
+    );
+  });
+  it("matches cid references case-insensitively against the content-id", () => {
+    const map = new Map([["logo@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages('<img src="cid:Logo@X">', map)).toBe(
+      '<img src="data:image/png;base64,AAA">'
+    );
+  });
+  it("leaves remote srcset values untouched", () => {
+    const html = '<img src="cid:a@x" srcset="https://x/y.png 2x">';
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    expect(rewriteCidImages(html, map)).toBe(
+      '<img src="data:image/png;base64,AAA" srcset="https://x/y.png 2x">'
+    );
+  });
+  it("preserves non-cid attributes when rewriting media tags", () => {
+    const map = new Map([["a@x", "data:image/png;base64,AAA"]]);
+    const out = rewriteCidImages('<img src="cid:a@x" width="200" alt="hi">', map);
+    expect(out).toBe('<img src="data:image/png;base64,AAA" width="200" alt="hi">');
+  });
+});
+
+describe("hasRemoteImages", () => {
+  it("detects https/http src images", () => {
+    expect(hasRemoteImages('<img src="https://x/y.png">')).toBe(true);
+    expect(hasRemoteImages('<img src="http://x/y.png">')).toBe(true);
+  });
+  it("detects protocol-relative and srcset references", () => {
+    expect(hasRemoteImages('<img src="//cdn.x/y.png">')).toBe(true);
+    expect(hasRemoteImages('<img srcset="//cdn.x/a.png 1x, /b.png 2x">')).toBe(true);
+  });
+  it("detects css url() and background/poster attributes", () => {
+    expect(hasRemoteImages('<div style="background:url(https://x/bg.png)">x</div>')).toBe(true);
+    expect(hasRemoteImages('<body background="https://x/bg.png">')).toBe(true);
+    expect(hasRemoteImages('<video poster="https://x/p.png"></video>')).toBe(true);
+  });
+  it("detects svg image href", () => {
+    expect(hasRemoteImages('<svg><image href="https://x/i.png"></image></svg>')).toBe(true);
+  });
+  it("is false for cid:, data:, and empty bodies", () => {
+    expect(hasRemoteImages('<img src="cid:a@x">')).toBe(false);
+    expect(hasRemoteImages('<img src="data:image/png;base64,AAA">')).toBe(false);
+    expect(hasRemoteImages("<p>no images here</p>")).toBe(false);
+    expect(hasRemoteImages(null)).toBe(false);
+  });
+});
+
+describe("placeholderRemoteImages", () => {
+  const BLANK = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
+  it("replaces remote src references with a blank gif", () => {
+    expect(placeholderRemoteImages('<img src="https://x/y.png">')).toBe(
+      `<img src="${BLANK}">`
+    );
+  });
+  it("leaves cid: and data: references untouched", () => {
+    expect(placeholderRemoteImages('<img src="cid:a@x" src="data:image/png;base64,AAA">')).toBe(
+      '<img src="cid:a@x" src="data:image/png;base64,AAA">'
+    );
+  });
+  it("replaces remote css url() and drops remote srcset candidates", () => {
+    expect(placeholderRemoteImages('<div style="background:url(https://x/bg.png)">x</div>')).toBe(
+      `<div style="background:url(\"${BLANK}\")">x</div>`
+    );
+    // A remote srcset is dropped (a data: URL would break srcset's comma
+    // grammar); the tag falls back to its own (blanked) src.
+    expect(placeholderRemoteImages('<img src="https://x/a.png" srcset="https://x/a.png 1x, /b.png 2x">')).toBe(
+      `<img src="${BLANK}">`
+    );
+    expect(placeholderRemoteImages('<img srcset="https://x/a.png 1x">')).toBe("<img>");
+  });
+  it("replaces remote svg image href", () => {
+    expect(placeholderRemoteImages('<svg><image href="https://x/i.png"></image></svg>')).toBe(
+      `<svg><image href="${BLANK}"></image></svg>`
     );
   });
 });
@@ -217,6 +334,20 @@ describe("renderViewBody", () => {
     const view = mockView();
     await renderViewBody(view, {});
     expect(view.frame.srcdoc).toContain("(empty message)");
+  });
+  it("passes the remote-images option through to the injected CSP", async () => {
+    const view = mockView();
+    await renderViewBody(
+      view,
+      { html: "<html><head></head><body>hi</body></html>" },
+      { remoteImages: true }
+    );
+    expect(view.frame.srcdoc).toContain("img-src * data: blob:");
+    // Default (no option): strict policy, remote images still blocked.
+    const strict = mockView();
+    await renderViewBody(strict, { html: "<html><head></head><body>hi</body></html>" });
+    expect(strict.frame.srcdoc).toContain("img-src data:");
+    expect(strict.frame.srcdoc).not.toContain("img-src *");
   });
 });
 
