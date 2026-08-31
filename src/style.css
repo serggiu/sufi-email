@@ -641,6 +641,10 @@ dialog textarea { resize: vertical; }
 }
 .thread-msg .att-item { font-size: 12.5px; padding: 3px 0; }
 
+/* Attachments sit above the body; separate them from the frame only when
+   the box actually has content. */
+.thread-msg-atts:not(:empty) { margin-bottom: 8px; }
+
 /* Opt-in banner for messages whose remote images are blocked. */
 .remote-bar {
   display: flex;

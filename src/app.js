@@ -970,7 +970,9 @@ async function renderThread(subjectEl, metaEl, container, thread) {
     const attsBox = document.createElement("div");
     attsBox.className = "thread-msg-atts";
 
-    block.append(head, frame, attsBox);
+    // Attachments render ABOVE the body (send/date head, then files, then
+    // message), so a message's files are visible before scrolling.
+    block.append(head, attsBox, frame);
     container.appendChild(block);
 
     // Body + attachment metadata in parallel (attachment listing is
