@@ -3,6 +3,16 @@
 A lightweight, configurable email client built with Rust + Tauri. Connects to
 standard IMAP/SMTP accounts, fetches mail, and sends messages.
 
+## Icon & artwork credit
+
+The app icon is adapted from **"Semakar"** — whirling-dervish line art by
+**Mahak (محک)** on Wikimedia Commons, licensed under
+[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0):
+
+- Original: https://commons.wikimedia.org/wiki/File:Semakar.svg
+- Adapted to a square sand-coloured tile (`src-tauri/icons/semakar-square.svg`);
+  the adapted version is distributed under the same CC BY-SA 3.0 license.
+
 ## Features (current)
 
 - Three-column UI: folders | message list | message preview (collapsible

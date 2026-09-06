@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Install the built Sufi Email app on this machine.
+#
+# Expects a bundle from a previous `bin/build` (the .deb in
+# src-tauri/target/release/bundle/). Chooses the best install route for the
+# current distribution:
+#
+#   * THIS machine (Omarchy, Arch-family): no dpkg/apt is available and we
+#     only ship a .deb, so a system install would need AUR tooling. The
+#     working path here is a *user-local install* (no root): the release
+#     binary lands in ~/.local/bin, icons in ~/.local/share/icons/hicolor,
+#     and a launcher entry in ~/.local/share/applications. This fallback is
+#     distro-agnostic and is used automatically when no native package
+#     route applies.
+#   * Debian/Ubuntu-family: `apt-get install ./…deb` (or dpkg -i + apt -f).
+#   * Arch-family WITH debtap installed: converts the .deb to a pacman
+#     package and installs it system-wide (untested — needs debtap).
+#   * Fedora/RHEL-family: needs a .rpm bundle (not built by default), so it
+#     falls through to the user-local install too.
+#
+# The non-local branches are written but can't be exercised on this machine.
+#
+# Usage:
+#   bin/install            # install newest .deb bundle
+#   bin/install --local    # force the user-local install
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+BUNDLE_DIR="$ROOT/src-tauri/target/release/bundle"
+DEB="$(ls -t "$BUNDLE_DIR"/deb/*.deb 2>/dev/null | head -1 || true)"
+RPM="$(ls -t "$BUNDLE_DIR"/rpm/*.rpm 2>/dev/null | head -1 || true)"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+say()  { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# The coreutils copy tool is also named `install` — exactly like this
+# script — and this script's bin/ directory can sit on PATH ahead of
+# /usr/bin. A bare `install` here would therefore resolve to THIS script
+# and re-execute it forever with the copy arguments (a fork bomb that
+# crushed the machine). Pin the real binary explicitly.
+if [ -x /usr/bin/install ]; then
+  INSTALL_BIN=/usr/bin/install
+elif [ -x /bin/install ]; then
+  INSTALL_BIN=/bin/install
+else
+  die "coreutils 'install' not found — can't copy files into place"
+fi
+
+# Run a command as root: as the invoking user when already root, otherwise
+# through sudo (refused politely if sudo is missing).
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    die "need root for '$1' but sudo is not available"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# User-local install: works everywhere without root. The route used on THIS
+# machine (Omarchy/Arch-family has no dpkg/apt and no debtap).
+# ---------------------------------------------------------------------------
+local_install() {
+  # Intended layout (see header): binary in the user bin dir (~/.local/bin),
+  # launcher entry + icons under the XDG data home (~/.local/share). Derive
+  # each directly rather than stringing a prefix together — XDG_DATA_HOME is
+  # often already set to ~/.local/share, and appending "/share" to it would
+  # double the path (~/.local/share/share/...), which launchers never scan.
+  local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local bin_dir="$HOME/.local/bin"
+  local apps_dir="$data_home/applications"
+  local icons_dir="$data_home/icons/hicolor"
+  local bin_src="$ROOT/src-tauri/target/release/sufi-email"
+
+  [ -x "$bin_src" ] || die "release binary missing — run 'bin/build' first"
+
+  say "Installing user-local (binary → $bin_dir, data → $data_home; no root needed)"
+  mkdir -p "$bin_dir" "$apps_dir"
+  for s in 32 128 512; do
+    mkdir -p "$icons_dir/${s}x${s}/apps"
+  done
+
+  "$INSTALL_BIN" -m 0755 "$bin_src" "$bin_dir/sufi-email"
+  "$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/32x32.png"  "$icons_dir/32x32/apps/sufi-email.png"
+  "$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/128x128.png" "$icons_dir/128x128/apps/sufi-email.png"
+  "$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/icon.png"    "$icons_dir/512x512/apps/sufi-email.png"
+
+  cat > "$apps_dir/sufi-email.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Sufi Email
+Comment=Lightweight IMAP/SMTP email client
+Exec=$bin_dir/sufi-email
+Icon=sufi-email
+Terminal=false
+Categories=Network;Email;
+StartupNotify=true
+EOF
+
+  # Best effort: refresh the desktop/icon databases if those tools exist.
+  if have update-desktop-database; then update-desktop-database "$apps_dir" >/dev/null 2>&1 || true; fi
+  if have gtk-update-icon-cache; then gtk-update-icon-cache -q -f "$icons_dir" >/dev/null 2>&1 || true; fi
+
+  echo "  Installed. Launch from your app launcher ('Sufi Email') or run:"
+  echo "    $bin_dir/sufi-email"
+  echo "  (Desktop entry picked up at the next login if it doesn't appear immediately.)"
+}
+
+# ---------------------------------------------------------------------------
+# Native package-manager branches (not testable on this machine).
+# ---------------------------------------------------------------------------
+debian_install() {
+  [ -n "$DEB" ] || die "no .deb bundle found — run 'bin/build' first"
+  say "Installing $DEB with apt"
+  if have apt-get; then
+    as_root apt-get install -y --reinstall "$DEB"
+  elif have dpkg; then
+    as_root dpkg -i "$DEB"
+    as_root apt-get install -f -y || warn "apt-get -f could not resolve dependencies"
+  else
+    die "neither apt-get nor dpkg is available"
+  fi
+}
+
+arch_debtap_install() {
+  [ -n "$DEB" ] || die "no .deb bundle found — run 'bin/build' first"
+  say "Converting .deb with debtap and installing via pacman"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  as_root debtap -q "$DEB" || die "debtap conversion failed (see debtap docs)"
+  # debtap writes <name>-<version>-x86_64.pkg.tar.zst next to the input.
+  local pkg; pkg="$(ls -t "${DEB%.deb}"*.pkg.tar.* 2>/dev/null | head -1 || true)"
+  [ -n "$pkg" ] || die "debtap produced no package — run 'debtap -u' first to refresh its database"
+  as_root pacman -U --noconfirm "$pkg"
+}
+
+fedora_install() {
+  if [ -n "$RPM" ] && have dnf; then
+    say "Installing $RPM with dnf"
+    as_root dnf install -y "$RPM"
+  else
+    warn "no .rpm bundle (or dnf missing) — falling back to user-local install"
+    local_install
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Distro detection & dispatch
+# ---------------------------------------------------------------------------
+[ -n "$DEB" ] || [ -n "$RPM" ] || die "no bundles found — run 'bin/build' first"
+
+FORCE_LOCAL=0
+[ "${1:-}" = "--local" ] && FORCE_LOCAL=1
+
+if [ "$FORCE_LOCAL" -eq 1 ]; then
+  local_install
+  exit 0
+fi
+
+# /etc/os-release is present on all modern systemd distros.
+FAMILY=unknown
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "$ID $ID_LIKE" in
+    *arch*)   FAMILY=arch ;;
+    *debian* | *ubuntu*) FAMILY=debian ;;
+    *fedora* | *rhel* | *centos*) FAMILY=fedora ;;
+  esac
+fi
+
+case "$FAMILY" in
+  debian) debian_install ;;
+  arch)
+    if have debtap && have pacman; then
+      arch_debtap_install
+    else
+      # This is the route that runs on THIS machine: no dpkg/apt, no debtap.
+      warn "Arch-family system without debtap — using the user-local install"
+      local_install
+    fi
+    ;;
+  fedora) fedora_install ;;
+  *)
+    warn "unrecognised distribution ('${ID:-?}') — using the user-local install"
+    local_install
+    ;;
+esac

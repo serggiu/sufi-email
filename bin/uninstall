@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Completely remove Sufi Email from this machine.
+#
+# Mirrors bin/install: removes whichever route was used to put the app
+# here, then scrubs every file the app owns at runtime:
+#
+#   * User-local install artifacts (the route bin/install uses on this
+#     machine): the binary in the user bin dir, the launcher entry, and
+#     the icons under the XDG data home. Also cleans the doubled-path
+#     leftovers (~/.local/share/bin, ~/.local/share/share/...) that the
+#     pre-fork-bomb-fix bin/install could write.
+#   * A system package if one is installed (sufi-email via dpkg on
+#     Debian/Ubuntu-family, or pacman for a debtap-converted Arch build).
+#   * Runtime data and caches: the start log (~/.cache/sufi-email), the
+#     WebKitGTK webview data dir (~/.local/share/com.sufi.email), and the
+#     account/mail-store dir (~/.config/sufi-email) — accounts, the
+#     .secret sealing key, and the offline cache all live there.
+#
+# Destructive by design: it asks for confirmation when run from a
+# terminal, and requires --yes otherwise.
+#
+# Usage:
+#   bin/uninstall         # interactive: lists everything, asks for a yes
+#   bin/uninstall --yes   # non-interactive: remove without prompting
+#   bin/uninstall --force # also kill a running instance first
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+say()  { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Run a command as root: as the invoking user when already root, otherwise
+# through sudo (refused politely if sudo is missing).
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    die "need root for '$1' but sudo is not available"
+  fi
+}
+
+FORCE=0
+YES=0
+for a in "$@"; do
+  case "$a" in
+    --yes|-y) YES=1 ;;
+    --force|-f) FORCE=1 ;;
+    *) die "unknown argument: $a (expected --yes and/or --force)" ;;
+  esac
+done
+
+# A running instance (tray icon, watchers, ...) would recreate cache and
+# config files while we delete them, so refuse unless --force kills it.
+APP_RUNNING="$(pgrep -x sufi-email || true)"
+if [ -n "$APP_RUNNING" ]; then
+  if [ "$FORCE" -eq 1 ]; then
+    warn "killing running Sufi Email (pid(s): $(echo "$APP_RUNNING" | tr '\n' ' '))"
+    pkill -x sufi-email || true
+    sleep 1
+    [ -z "$(pgrep -x sufi-email || true)" ] || die "could not stop Sufi Email — quit it from the tray menu and retry"
+  else
+    die "Sufi Email is running (pid(s): $(echo "$APP_RUNNING" | tr '\n' ' ')) — quit it first, or rerun with --force"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Inventory everything the app owns on this machine.
+# ---------------------------------------------------------------------------
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sufi-email"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/sufi-email"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+bin_files=(
+  "$HOME/.local/bin/sufi-email"                 # current install (bin/install)
+  "$data_home/bin/sufi-email"                   # leftover from pre-fix bin/install
+)
+desktop_files=(
+  "$data_home/applications/sufi-email.desktop"  # current install
+  "$data_home/share/applications/sufi-email.desktop"  # leftover from pre-fix bin/install
+)
+icon_dirs=(
+  "$data_home/icons/hicolor"
+  "$data_home/share/icons/hicolor"
+)
+dirs_to_remove=(
+  "$cache_dir"                 # start log etc.
+  "$data_home/com.sufi.email"  # WebKitGTK webview data (localstorage, cookies, caches)
+  "$config_dir"                # accounts, .secret key, offline mail store
+)
+
+# Collect the icons that exist (any theme size), for exact removal.
+icons=()
+for base in "${icon_dirs[@]}"; do
+  for f in "$base"/*/apps/sufi-email.png; do
+    [ -e "$f" ] && icons+=("$f")
+  done
+done
+
+# Package-manager installs (the routes bin/install can take on other
+# distros): only act when the package is actually present.
+pkg_cmd=()
+if have dpkg-query && dpkg-query -W sufi-email >/dev/null 2>&1; then
+  pkg_cmd=(as_root dpkg -r sufi-email)
+elif have pacman && pacman -Q sufi-email >/dev/null 2>&1; then
+  pkg_cmd=(as_root pacman -R --noconfirm sufi-email)
+fi
+
+# ---------------------------------------------------------------------------
+# Confirm what is about to go.
+# ---------------------------------------------------------------------------
+list=()
+for f in "${bin_files[@]}" "${desktop_files[@]}" "${icons[@]}" "${dirs_to_remove[@]}"; do
+  [ -e "$f" ] && list+=("$f")
+done
+[ ${#pkg_cmd[@]} -gt 0 ] && list+=("package sufi-email")
+
+if [ ${#list[@]} -eq 0 ]; then
+  echo "Sufi Email does not appear to be installed — nothing to remove."
+  exit 0
+fi
+
+say "This will remove:"
+for item in "${list[@]}"; do
+  printf '  - %s\n' "$item"
+done
+warn "This deletes ALL Sufi Email data: accounts, the encryption key, and the offline mail cache."
+
+if [ "$YES" -eq 0 ]; then
+  if [ ! -t 0 ]; then
+    die "refusing to run without a terminal — rerun with --yes to confirm deletion"
+  fi
+  read -r -p "Continue? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted — nothing was removed."; exit 1 ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# Remove.
+# ---------------------------------------------------------------------------
+for f in "${bin_files[@]}" "${desktop_files[@]}" "${icons[@]}"; do
+  if [ -e "$f" ]; then rm -f "$f"; say "removed $f"; fi
+done
+
+# Only prune the icon directories we may have emptied (rmdir fails silently
+# when a dir still holds other apps' icons).
+for base in "${icon_dirs[@]}"; do
+  for size in "$base"/*/apps; do
+    rmdir "$size" 2>/dev/null || true
+    rmdir "${size%/apps}" 2>/dev/null || true
+  done
+done
+
+for d in "${dirs_to_remove[@]}"; do
+  if [ -e "$d" ]; then rm -rf "$d"; say "removed $d"; fi
+done
+
+if [ ${#pkg_cmd[@]} -gt 0 ]; then
+  say "removing system package sufi-email"
+  "${pkg_cmd[@]}"
+fi
+
+# Best effort: refresh the desktop/icon databases if those tools exist.
+if have update-desktop-database; then update-desktop-database "$data_home/applications" >/dev/null 2>&1 || true; fi
+if have gtk-update-icon-cache; then gtk-update-icon-cache -q -f "$data_home/icons/hicolor" >/dev/null 2>&1 || true; fi
+
+echo
+echo "  Sufi Email removed: binaries, launcher entry, icons, package (if any),"
+echo "  and all runtime data (config, secrets, caches)."
