@@ -215,6 +215,23 @@ impl TrayGuard {
     }
 }
 
+/// Whether the current tray icon still needs a repaint for `visual`: its
+/// recorded "fully shown" state differs from what we are asked to show. The
+/// state is only recorded once a repaint applied the tooltip as well, so a
+/// tooltip that had to be skipped while the watcher was absent always leaves
+/// the icon "not fully shown" and is repainted once tooltips are safe again.
+fn needs_tray_repaint(shown: Option<TrayVisual>, visual: TrayVisual) -> bool {
+    shown != Some(visual)
+}
+
+/// The libappindicator tooltip setter may only run while the tray icon is
+/// known to have been built after the last watcher change and never to have
+/// been through a fallback cycle — exactly [`TraySafety::Clean`] (see the
+/// `TraySafety` docs for why).
+fn tooltip_safe(safety: TraySafety) -> bool {
+    matches!(safety, TraySafety::Clean)
+}
+
 /// Set the tray icon (grey envelope with no unread mail, blue otherwise)
 /// and its tooltip, which follows the unread count. Both the StatusNotifierItem
 /// Title and ToolTip are updated (the vendored tray-icon patches make
@@ -234,7 +251,7 @@ pub(crate) fn update_tray_icon(app: &tauri::AppHandle) {
     };
 
     // The current icon already fully shows this state.
-    if *tray_guard.shown.lock().unwrap() == Some(visual) {
+    if !needs_tray_repaint(*tray_guard.shown.lock().unwrap(), visual) {
         return;
     }
 
@@ -247,7 +264,7 @@ pub(crate) fn update_tray_icon(app: &tauri::AppHandle) {
     let _ = tray.set_icon(Some(tray_icon(unread)));
 
     // The one call that can crash on a poisoned indicator (see TraySafety).
-    if tray_guard.safety() == TraySafety::Clean {
+    if tooltip_safe(tray_guard.safety()) {
         let _ = tray.set_tooltip(Some(tooltip));
         // Only remember the state once the tooltip landed, so a later
         // transition to Clean repaints a tooltip that had to be skipped.
@@ -353,6 +370,38 @@ fn watcher_present(conn: &zbus::blocking::Connection) -> bool {
     .unwrap_or(false)
 }
 
+/// What the tray watcher monitor must do after sampling the bus, decided by
+/// the pure function [`watcher_action`]. Kept separate from the monitor loop
+/// so the safety invariants can be unit-tested (see `main_tests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherAction {
+    /// The watcher is (or just went) absent: tooltip updates must stop.
+    Suppress,
+    /// The watcher came back after an absence: the current AppIndicator may
+    /// carry a dangling tooltip handler, so tooltips stay locked until the
+    /// icon is rebuilt (see [`rebuild_tray`]).
+    RebuildPending,
+    /// First sighting of the watcher and it is up: the icon created during
+    /// setup predates this monitor, is assumed clean, so tooltips unlock and
+    /// the pending repaint is flushed without a rebuild.
+    UnlockClean,
+    /// Nothing changed; keep the previous state.
+    Nothing,
+}
+
+/// Pure decision table behind the tray watcher monitor: given the last known
+/// watcher state `watcher_up` (`None` = not sampled yet) and a fresh
+/// `present` sample, what must happen next?
+fn watcher_action(watcher_up: Option<bool>, present: bool) -> WatcherAction {
+    match (watcher_up, present) {
+        (None, true) => WatcherAction::UnlockClean,
+        (None, false) => WatcherAction::Suppress,
+        (Some(false), true) => WatcherAction::RebuildPending,
+        (Some(true), false) => WatcherAction::Suppress,
+        _ => WatcherAction::Nothing,
+    }
+}
+
 /// Watch the StatusNotifierWatcher and keep the tray icon safe from
 /// libayatana-appindicator's tooltip use-after-free (see [`TraySafety`]).
 ///
@@ -379,23 +428,27 @@ fn spawn_tray_watcher_monitor(app: tauri::AppHandle, tray_guard: Arc<TrayGuard>)
         let mut watcher_up: Option<bool> = None;
         loop {
             let present = watcher_present(&conn);
-            match (watcher_up, present) {
-                // First sighting. The icon was just created during setup; if
-                // the watcher is already up it was up when the icon was made
-                // (no fallback cycle possible), so unlock tooltips and flush
-                // what the pre-watcher repaint had to skip.
-                (None, true) => {
+            match watcher_action(watcher_up, present) {
+                WatcherAction::UnlockClean => {
+                    // First sighting while up: the icon was just created
+                    // during setup; if the watcher is already up it was up
+                    // when the icon was made (no fallback cycle possible), so
+                    // unlock tooltips and flush what the pre-watcher repaint
+                    // had to skip.
                     watcher_up = Some(true);
                     tray_guard.set_safety(TraySafety::Clean);
                     force_repaint(&app, &tray_guard);
                 }
-                (None, false) => {
-                    watcher_up = Some(false);
+                WatcherAction::Suppress => {
+                    // The watcher went away (or was never seen): tooltips are
+                    // unsafe until it is back and the icon has been rebuilt.
+                    watcher_up = Some(present);
                     tray_guard.set_safety(TraySafety::WatcherAbsent);
                 }
-                // The watcher came back after an absence: the current icon may
-                // be poisoned — replace it before any tooltip update can run.
-                (Some(false), true) => {
+                WatcherAction::RebuildPending => {
+                    // The watcher came back after an absence: the current
+                    // icon may be poisoned — replace it before any tooltip
+                    // update can run.
                     watcher_up = Some(true);
                     tray_guard.set_safety(TraySafety::RebuildPending);
                     let app2 = app.clone();
@@ -403,13 +456,7 @@ fn spawn_tray_watcher_monitor(app: tauri::AppHandle, tray_guard: Arc<TrayGuard>)
                         log::error!("tray watcher monitor: could not schedule rebuild: {e}");
                     }
                 }
-                // The watcher went away: tooltips are unsafe until it is back
-                // and the icon has been rebuilt.
-                (Some(true), false) => {
-                    watcher_up = Some(false);
-                    tray_guard.set_safety(TraySafety::WatcherAbsent);
-                }
-                _ => {}
+                WatcherAction::Nothing => {}
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1940,6 +1987,124 @@ mod main_tests {
             Some(v) => std::env::set_var("XDG_CURRENT_DESKTOP", v),
             None => std::env::remove_var("XDG_CURRENT_DESKTOP"),
         }
+    }
+    // ---------------------------------------------------------------------
+    // Tray watcher / tooltip-safety logic.
+    //
+    // The crash this fix guards (libayatana-appindicator's tooltip
+    // use-after-free) happens inside a dlopened C library and needs a live
+    // session bus plus a tray host to reproduce, so no end-to-end test is
+    // possible here. These tests pin the pure decision logic instead: when
+    // tooltip updates may run, when the icon must be rebuilt, and when a
+    // repaint can be skipped. See the TraySafety docs in main.rs for the bug
+    // mechanics.
+    // ---------------------------------------------------------------------
+
+    fn tray_visual(unread: u32) -> super::TrayVisual {
+        super::TrayVisual {
+            unread,
+            tint: (1, 2, 3),
+        }
+    }
+
+    #[test]
+    fn watcher_action_table() {
+        use super::WatcherAction;
+        // Not sampled yet: the first sighting decides — watcher up unlocks
+        // without a rebuild (the setup icon predates the monitor), down
+        // suppresses.
+        assert_eq!(super::watcher_action(None, true), WatcherAction::UnlockClean);
+        assert_eq!(super::watcher_action(None, false), WatcherAction::Suppress);
+        // Steady states change nothing.
+        assert_eq!(super::watcher_action(Some(true), true), WatcherAction::Nothing);
+        assert_eq!(super::watcher_action(Some(false), false), WatcherAction::Nothing);
+        // The watcher left: suppress tooltips (the library may be about to
+        // create its fallback icon behind our back).
+        assert_eq!(super::watcher_action(Some(true), false), WatcherAction::Suppress);
+        // The core invariant: a return after an absence demands a rebuild of
+        // the (possibly poisoned) icon before tooltips may resume. Losing
+        // this arm would regress the crash.
+        assert_eq!(super::watcher_action(Some(false), true), WatcherAction::RebuildPending);
+    }
+
+    #[test]
+    fn watcher_action_unlock_only_before_any_absence() {
+        // A long uninterrupted presence must never ask for a rebuild, and
+        // only the very first sample may unlock tooltips.
+        let mut state: Option<bool> = None;
+        let (mut unlocks, mut rebuilds) = (0, 0);
+        for present in [true; 200] {
+            match super::watcher_action(state, present) {
+                super::WatcherAction::UnlockClean => unlocks += 1,
+                super::WatcherAction::RebuildPending => rebuilds += 1,
+                _ => {}
+            }
+            state = Some(present);
+        }
+        assert_eq!(unlocks, 1);
+        assert_eq!(rebuilds, 0);
+    }
+
+    #[test]
+    fn watcher_action_each_loss_and_return_demands_one_rebuild() {
+        // Churn the watcher (absent long enough to arm the bug, then back)
+        // and check each return produces exactly one rebuild request, with
+        // tooltips suppressed for the whole absence.
+        let samples = [true, true, false, false, true, false, true];
+        let mut state: Option<bool> = None;
+        let mut events = Vec::new();
+        for &present in &samples {
+            events.push(super::watcher_action(state, present));
+            state = Some(present);
+        }
+        assert_eq!(
+            events,
+            vec![
+                super::WatcherAction::UnlockClean,   // first sample, watcher up
+                super::WatcherAction::Nothing,       // still up
+                super::WatcherAction::Suppress,      // left
+                super::WatcherAction::Nothing,       // still away
+                super::WatcherAction::RebuildPending, // back -> rebuild
+                super::WatcherAction::Suppress,      // left again
+                super::WatcherAction::RebuildPending, // back -> rebuild again
+            ]
+        );
+    }
+
+    #[test]
+    fn tooltip_setter_safe_only_while_clean() {
+        use super::TraySafety;
+        assert!(!super::tooltip_safe(TraySafety::WatcherAbsent));
+        assert!(!super::tooltip_safe(TraySafety::RebuildPending));
+        assert!(super::tooltip_safe(TraySafety::Clean));
+    }
+
+    #[test]
+    fn tray_safety_encodes_conservatively() {
+        use super::TraySafety;
+        for s in [
+            TraySafety::WatcherAbsent,
+            TraySafety::RebuildPending,
+            TraySafety::Clean,
+        ] {
+            assert_eq!(super::TraySafety::from_u8(s.to_u8()), s);
+        }
+        // Unknown bytes must decode to the most restrictive state.
+        assert_eq!(super::TraySafety::from_u8(255), TraySafety::WatcherAbsent);
+    }
+
+    #[test]
+    fn tray_repaint_gated_on_full_visual() {
+        let v = tray_visual(3);
+        // A fresh icon (nothing fully shown yet) always needs a repaint.
+        assert!(super::needs_tray_repaint(None, v));
+        // Fully shown (tooltip included) -> skip.
+        assert!(!super::needs_tray_repaint(Some(v), v));
+        // Unread count changed -> repaint.
+        assert!(super::needs_tray_repaint(Some(tray_visual(0)), v));
+        // Same unread but the theme tint changed -> repaint (icon recolor).
+        let recolored = super::TrayVisual { unread: 3, tint: (9, 9, 9) };
+        assert!(super::needs_tray_repaint(Some(recolored), v));
     }
 }
 
