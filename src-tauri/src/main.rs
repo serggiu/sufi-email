@@ -18,7 +18,7 @@ mod store_tests;
 
 use account::{AccountConfig, AccountInfo, Config};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -72,14 +72,13 @@ fn tint_envelope(r: u8, g: u8, b: u8) -> tauri::image::Image<'static> {
     tauri::image::Image::from_bytes(&buf).expect("encoded tray icon")
 }
 
-/// The tray envelope icon: filled with the active theme's foreground when
-/// there is no unread mail (matching the bar's other tinted icons, e.g.
-/// Slack/Telegram) and the theme's accent when mail is waiting — so the
-/// icon follows the desktop theme while keeping the blue unread cue. Falls
-/// back to the built-in near-white/blue when no Omarchy theme is staged.
-fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
+/// The RGB tint the tray envelope should carry for the given unread state:
+/// the active theme's accent when mail is waiting, its foreground otherwise.
+/// Falls back to the built-in blue / near-white when no Omarchy theme is
+/// staged (mirrors the defaults used by [`tray_icon`]).
+fn tray_tint(unread: u32) -> (u8, u8, u8) {
     let theme = theme::read_theme_colors();
-    let (r, g, b) = if unread > 0 {
+    if unread > 0 {
         theme
             .as_ref()
             .and_then(|t| hex_rgb(&t.accent))
@@ -89,7 +88,16 @@ fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
             .as_ref()
             .and_then(|t| hex_rgb(&t.foreground))
             .unwrap_or((0xec, 0xec, 0xef)) // built-in near-white
-    };
+    }
+}
+
+/// The tray envelope icon: filled with the active theme's foreground when
+/// there is no unread mail (matching the bar's other tinted icons, e.g.
+/// Slack/Telegram) and the theme's accent when mail is waiting — so the
+/// icon follows the desktop theme while keeping the blue unread cue. Falls
+/// back to the built-in near-white/blue when no Omarchy theme is staged.
+fn tray_icon(unread: u32) -> tauri::image::Image<'static> {
+    let (r, g, b) = tray_tint(unread);
     tint_envelope(r, g, b)
 }
 
@@ -117,18 +125,133 @@ fn tray_tooltip(unread: u32) -> String {
     }
 }
 
+/// The visual state the tray icon is currently asked to show. Repaints are
+/// gated on this, so routine mail events that leave the unread count and the
+/// theme tint unchanged stop rewriting the icon PNG and issuing DBus property
+/// updates on every folder refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayVisual {
+    unread: u32,
+    /// Envelope tint: the theme's accent when unread > 0, its foreground
+    /// otherwise.
+    tint: (u8, u8, u8),
+}
+
+/// Whether it is safe to call the libappindicator tooltip setter on the
+/// current tray icon.
+///
+/// libayatana-appindicator (0.6.x, and still upstream through master) has a
+/// use-after-free: when the StatusNotifierWatcher (the omarchy-shell tray
+/// host) is absent for more than ~100 ms it creates an XEmbed fallback
+/// GtkStatusIcon and connects its "tooltip"-changed handler with that icon as
+/// `data` (`fallback()` in app-indicator.c). When the watcher comes back,
+/// `unfallback()` unrefs the icon but never disconnects that handler, so the
+/// next `app_indicator_set_tooltip_full()` dereferences the freed icon and
+/// segfaults — observed here as SIGSEGV in `gtk_status_icon_set_tooltip_markup`
+/// on 4 of the last 5 crashes.
+///
+/// The SNI ToolTip can only be updated through that same C call, and omarchy's
+/// tray shows the item's ToolTip on hover (Quickshell refreshes it only on
+/// the NewToolTip signal), so the app cannot simply stop updating it. Instead
+/// it only ever makes that call against an AppIndicator that has not been
+/// through a fallback cycle: never while the watcher is absent, and the icon
+/// is rebuilt (a fresh AppIndicator) after any absence that could have armed
+/// the bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraySafety {
+    /// No watcher on the bus — do not call the tooltip setter.
+    WatcherAbsent,
+    /// The watcher is (back) up but the current icon may be poisoned; it must
+    /// be rebuilt before tooltips resume.
+    RebuildPending,
+    /// The watcher is up and the current icon was built after the last
+    /// absence — safe to update the tooltip.
+    Clean,
+}
+
+impl TraySafety {
+    fn to_u8(self) -> u8 {
+        match self {
+            TraySafety::WatcherAbsent => 0,
+            TraySafety::RebuildPending => 1,
+            TraySafety::Clean => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => TraySafety::RebuildPending,
+            2 => TraySafety::Clean,
+            _ => TraySafety::WatcherAbsent,
+        }
+    }
+}
+
+/// Shared, thread-safe state coordinating tray-icon rebuilds (see
+/// [`TraySafety`]) and change-gated repaints.
+pub(crate) struct TrayGuard {
+    safety: AtomicU8,
+    /// The visual the current tray icon fully shows (tooltip included). None
+    /// while the icon is fresh or predates the last watcher change.
+    shown: Mutex<Option<TrayVisual>>,
+}
+
+impl TrayGuard {
+    fn new() -> Self {
+        Self {
+            // Assume no watcher until the monitor thread proves otherwise, so
+            // the startup repaint never races a mid-startup fallback.
+            safety: AtomicU8::new(TraySafety::WatcherAbsent.to_u8()),
+            shown: Mutex::new(None),
+        }
+    }
+
+    fn safety(&self) -> TraySafety {
+        TraySafety::from_u8(self.safety.load(Ordering::Acquire))
+    }
+
+    fn set_safety(&self, safety: TraySafety) {
+        self.safety.store(safety.to_u8(), Ordering::Release);
+    }
+}
+
 /// Set the tray icon (grey envelope with no unread mail, blue otherwise)
 /// and its tooltip, which follows the unread count. Both the StatusNotifierItem
 /// Title and ToolTip are updated (the vendored tray-icon patches make
 /// set_title/set_tooltip work on Linux); tray hosts like omarchy prefer the
 /// ToolTip.
+///
+/// Change-gated on [`TrayVisual`], and the tooltip setter is only reached
+/// while [`TraySafety::Clean`] (see [`TrayGuard`]). Safe to call from any
+/// thread: tauri marshals the tray calls onto the main thread.
 pub(crate) fn update_tray_icon(app: &tauri::AppHandle) {
+    let tray_guard = app.state::<AppState>().tray_guard.clone();
+
     let unread = total_unread(app);
+    let visual = TrayVisual {
+        unread,
+        tint: tray_tint(unread),
+    };
+
+    // The current icon already fully shows this state.
+    if *tray_guard.shown.lock().unwrap() == Some(visual) {
+        return;
+    }
+
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return;
+    };
+
     let tooltip = tray_tooltip(unread);
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let _ = tray.set_title(Some(tooltip.clone()));
+    let _ = tray.set_title(Some(tooltip.clone()));
+    let _ = tray.set_icon(Some(tray_icon(unread)));
+
+    // The one call that can crash on a poisoned indicator (see TraySafety).
+    if tray_guard.safety() == TraySafety::Clean {
         let _ = tray.set_tooltip(Some(tooltip));
-        let _ = tray.set_icon(Some(tray_icon(unread)));
+        // Only remember the state once the tooltip landed, so a later
+        // transition to Clean repaints a tooltip that had to be skipped.
+        *tray_guard.shown.lock().unwrap() = Some(visual);
     }
 }
 
@@ -144,12 +267,26 @@ fn is_hyprland() -> bool {
             .unwrap_or(false)
 }
 
-/// Create the tray icon with its menu, and wire "Open Sufi Email" / "Quit".
+/// Create the tray icon with its menu and wire "Open Sufi Email" / "Quit",
+/// then start the monitor that keeps the icon safe from libayatana-
+/// appindicator's tooltip use-after-free (see [`TraySafety`]).
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    build_tray(app)?;
+    let tray_guard = app.state::<AppState>().tray_guard.clone();
+    spawn_tray_watcher_monitor(app.clone(), tray_guard);
+    Ok(())
+}
+
+/// (Re)create the tray icon with its menu. Each call builds a fresh menu and
+/// a fresh libappindicator object — a new object is the only way to drop a
+/// tooltip handler left dangling by an earlier fallback cycle (see
+/// [`TraySafety`]). Must run on the main thread.
+///
 /// Note: on Linux the tray backend (libappindicator) does not deliver icon
 /// click events — the host shows the menu on click, so "Open Sufi Email" is
 /// the reliable way to open the window there. The left-click handler covers
 /// platforms/hosts that do report clicks.
-fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Open Sufi Email", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -174,11 +311,109 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
     // The Linux backend ignores set_tooltip; the host shows the StatusNotifier
-    // title instead, so set both.
+    // title instead, so set both. Safe here: this icon is brand new.
     let _ = tray.set_tooltip(Some("Sufi Email"));
     let _ = tray.set_title(Some("Sufi Email"));
     Ok(())
+}
+
+/// Remove the current tray icon and build a fresh one, then repaint it with
+/// the latest state. Must run on the main thread; see [`TraySafety`].
+fn rebuild_tray(app: &tauri::AppHandle) {
+    app.remove_tray_by_id("main-tray");
+    if let Err(e) = build_tray(app) {
+        log::error!("failed to rebuild tray icon: {e}");
+    }
+    let tray_guard = &app.state::<AppState>().tray_guard;
+    tray_guard.set_safety(TraySafety::Clean);
+    force_repaint(app, tray_guard);
+}
+
+/// Force `update_tray_icon` to repaint even when the visual is unchanged.
+/// Safe from any thread: the actual tray calls are marshalled to the main
+/// thread by tauri.
+fn force_repaint(app: &tauri::AppHandle, tray_guard: &TrayGuard) {
+    *tray_guard.shown.lock().unwrap() = None;
+    update_tray_icon(app);
+}
+
+/// True while something owns the StatusNotifierWatcher name on the session
+/// bus (the omarchy-shell tray host).
+fn watcher_present(conn: &zbus::blocking::Connection) -> bool {
+    conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "NameHasOwner",
+        &("org.kde.StatusNotifierWatcher",),
+    )
+    .map(|reply| reply.body().deserialize::<bool>().unwrap_or(false))
+    .unwrap_or(false)
+}
+
+/// Watch the StatusNotifierWatcher and keep the tray icon safe from
+/// libayatana-appindicator's tooltip use-after-free (see [`TraySafety`]).
+///
+/// Polling cadence: the bug is only armed when the watcher stays absent long
+/// enough (~100 ms) for the library to create its XEmbed fallback icon and
+/// then comes back, freeing the icon behind the still-connected tooltip
+/// handler. Polling every 50 ms guarantees any such absence is observed as an
+/// "absent" sample, which suppresses tooltip updates until the icon has been
+/// rebuilt after the watcher returns.
+fn spawn_tray_watcher_monitor(app: tauri::AppHandle, tray_guard: Arc<TrayGuard>) {
+    std::thread::spawn(move || {
+        // The session bus may not be reachable yet at login; keep retrying.
+        let conn = loop {
+            match zbus::blocking::Connection::session() {
+                Ok(conn) => break conn,
+                Err(e) => {
+                    log::warn!("tray watcher monitor: session bus unavailable: {e}");
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        };
+
+        // None = not sampled yet, Some(present) = last known state.
+        let mut watcher_up: Option<bool> = None;
+        loop {
+            let present = watcher_present(&conn);
+            match (watcher_up, present) {
+                // First sighting. The icon was just created during setup; if
+                // the watcher is already up it was up when the icon was made
+                // (no fallback cycle possible), so unlock tooltips and flush
+                // what the pre-watcher repaint had to skip.
+                (None, true) => {
+                    watcher_up = Some(true);
+                    tray_guard.set_safety(TraySafety::Clean);
+                    force_repaint(&app, &tray_guard);
+                }
+                (None, false) => {
+                    watcher_up = Some(false);
+                    tray_guard.set_safety(TraySafety::WatcherAbsent);
+                }
+                // The watcher came back after an absence: the current icon may
+                // be poisoned — replace it before any tooltip update can run.
+                (Some(false), true) => {
+                    watcher_up = Some(true);
+                    tray_guard.set_safety(TraySafety::RebuildPending);
+                    let app2 = app.clone();
+                    if let Err(e) = app.run_on_main_thread(move || rebuild_tray(&app2)) {
+                        log::error!("tray watcher monitor: could not schedule rebuild: {e}");
+                    }
+                }
+                // The watcher went away: tooltips are unsafe until it is back
+                // and the icon has been rebuilt.
+                (Some(true), false) => {
+                    watcher_up = Some(false);
+                    tray_guard.set_safety(TraySafety::WatcherAbsent);
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
 }
 
 /// Show and focus the main window (used by the tray's left-click and the
@@ -200,6 +435,9 @@ pub struct AppState {
     /// added at runtime, and so delete_account can stop a watcher before
     /// removing the account's local cache.
     pub idle_watchers: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Coordinates tray-icon rebuilds around libayatana-appindicator's
+    /// tooltip use-after-free (see `TraySafety`) and gates tray repaints.
+    pub(crate) tray_guard: Arc<TrayGuard>,
 }
 
 /// Fire the silent new-mail toast through the OS notification daemon.
@@ -1550,6 +1788,7 @@ fn main() {
         .manage(AppState {
             config: Mutex::new(config),
             idle_watchers: Mutex::new(HashMap::new()),
+            tray_guard: Arc::new(TrayGuard::new()),
         })
         .setup(|app| {
             spawn_missing_idle_watchers(app.handle());
