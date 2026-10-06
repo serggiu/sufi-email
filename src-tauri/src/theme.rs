@@ -65,10 +65,13 @@ pub fn theme_colors_path() -> PathBuf {
     if let Ok(override_path) = std::env::var("SUFI_EMAIL_THEME_FILE") {
         return PathBuf::from(override_path);
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .parent()
-        .map(|p| p.join(".local/state/omarchy/current/theme/colors.toml"))
+    // Omarchy stages the palette under the user's home, not under
+    // XDG_CONFIG_HOME. Resolve it from the home dir directly: under Flatpak the
+    // config dir is remapped into ~/.var/app, so deriving the path from
+    // config_dir().parent() would point into the sandbox and never see the
+    // host theme. A `--filesystem` grant on ~/.local/state/omarchy exposes it.
+    dirs::home_dir()
+        .map(|home| home.join(".local/state/omarchy/current/theme/colors.toml"))
         .unwrap_or_else(|| PathBuf::from("colors.toml"))
 }
 

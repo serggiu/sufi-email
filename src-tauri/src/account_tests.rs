@@ -2,7 +2,7 @@
 //! placeholder cleanup, plaintext password migration.
 
 use crate::crypto_tests::with_config_dir;
-use crate::account::{AccountConfig, AccountInfo, Config};
+use crate::account::{AccountConfig, AccountInfo, Config, WindowSize};
 
 fn sample_account(name: &str, email: &str, password: &str) -> AccountConfig {
     AccountConfig {
@@ -40,6 +40,73 @@ fn missing_config_file_loads_as_empty() {
     with_config_dir(|_| {
         let cfg = Config::load_or_default();
         assert!(cfg.accounts.is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Remembered window size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn window_size_round_trips_with_accounts() {
+    with_config_dir(|_| {
+        let mut cfg = Config::default();
+        cfg.accounts.push(sample_account("Work", "w@x.org", "pw1"));
+        cfg.window = Some(WindowSize {
+            width: 1234,
+            height: 777,
+        });
+        cfg.save().unwrap();
+
+        let loaded = Config::load_or_default();
+        assert_eq!(
+            loaded.window,
+            Some(WindowSize {
+                width: 1234,
+                height: 777
+            })
+        );
+        // The accounts must survive the added top-level table.
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(loaded.accounts[0].name, "Work");
+    });
+}
+
+#[test]
+fn config_without_a_window_table_still_loads() {
+    with_config_dir(|dir| {
+        // A pre-feature config (no [window] table) must parse; the size then
+        // simply hasn't been remembered yet.
+        let toml_text = r#"
+[[accounts]]
+name = "Real"
+email = "real@test.org"
+imap_host = "imap.test"
+imap_port = 993
+smtp_host = "smtp.test"
+smtp_port = 465
+username = "real@test.org"
+password = "sealed-blob-here"
+"#;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.toml"), toml_text).unwrap();
+
+        let cfg = Config::load_or_default();
+        assert_eq!(cfg.window, None);
+        assert_eq!(cfg.accounts.len(), 1);
+    });
+}
+
+#[test]
+fn absent_window_size_is_not_serialized() {
+    with_config_dir(|_| {
+        let cfg = Config::default();
+        cfg.save().unwrap();
+        let raw = std::fs::read_to_string(Config::path()).unwrap();
+        assert!(
+            !raw.contains("[window]"),
+            "no [window] table until a size is known: {raw}"
+        );
     });
 }
 

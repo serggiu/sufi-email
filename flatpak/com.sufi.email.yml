@@ -1,0 +1,60 @@
+# Flatpak manifest for Sufi Email.
+#
+# Built by bin/flatpak, which builds the self-contained release binary
+# (bin/build --no-bundle) and stages it under flatpak/sources/ before invoking
+# flatpak-builder. The GNOME runtime supplies the app's runtime libraries:
+# WebKitGTK 4.1, GTK 3 and libsoup 3.
+#
+# No Flatpak runtime ships an appindicator library, so the system tray cannot
+# be shown inside the sandbox; the app detects this at startup and runs
+# tray-less instead of crashing (see appindicator_available() in
+# src-tauri/src/main.rs). Add a libayatana-appindicator module to this
+# manifest if you want a tray-enabled Flatpak.
+
+id: com.sufi.email
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: sufi-email
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # IMAP/SMTP network access.
+  - --share=network
+  # Desktop notifications (notify-rust calls the session-bus name directly).
+  - --talk-name=org.freedesktop.Notifications
+  # Tray support: harmless without an appindicator library, and what the
+  # tray-icon crate needs if one is added to the runtime/build later.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --filesystem=xdg-run/tray-icon:create
+  # Follow the host Omarchy theme when present (read-only; a no-op elsewhere).
+  - --filesystem=~/.local/state/omarchy:ro
+
+modules:
+  - name: sufi-email
+    buildsystem: simple
+    sources:
+      # Staged by bin/flatpak from src-tauri.
+      - type: file
+        path: sources/sufi-email
+      - type: file
+        path: sources/32x32.png
+      - type: file
+        path: sources/128x128.png
+      - type: file
+        path: sources/icon.png
+      # Author-maintained metadata (kept in flatpak/).
+      - type: file
+        path: com.sufi.email.desktop
+      - type: file
+        path: com.sufi.email.metainfo.xml
+    build-commands:
+      - install -Dm755 sufi-email /app/bin/sufi-email
+      - install -Dm644 32x32.png /app/share/icons/hicolor/32x32/apps/com.sufi.email.png
+      - install -Dm644 128x128.png /app/share/icons/hicolor/128x128/apps/com.sufi.email.png
+      - install -Dm644 icon.png /app/share/icons/hicolor/512x512/apps/com.sufi.email.png
+      - install -Dm644 com.sufi.email.desktop /app/share/applications/com.sufi.email.desktop
+      - install -Dm644 com.sufi.email.metainfo.xml /app/share/metainfo/com.sufi.email.metainfo.xml

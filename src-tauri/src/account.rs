@@ -42,6 +42,18 @@ pub struct AccountConfig {
 pub struct Config {
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    /// Last window size (logical pixels), so the app reopens at the size the
+    /// user left it at. Absent until the user has resized the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowSize>,
+}
+
+/// Remembered main-window size, in logical pixels (DPI-independent, so the
+/// same value restores sensibly on a display with a different scale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSize {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Non-secret view of an account, sent to the frontend.

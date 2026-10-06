@@ -41,6 +41,12 @@ const TRAY_ICON_SHAPE: &[u8] = include_bytes!("../icons/tray-gray.png");
 /// DONE/IDLE round trip surfaces a dead link within a couple of minutes.
 const IDLE_KEEPALIVE_SECS: u64 = 120;
 
+/// How many times the resize handler re-applies a remembered window size
+/// before giving up. Wayland can drop a resize requested before the window is
+/// mapped and then report a decorations-offset size, so a couple of retries
+/// after the surface is mapped are needed for the size to stick.
+const WINDOW_RESTORE_ATTEMPTS: u8 = 5;
+
 /// Parse a "#rrggbb" hex color into (r, g, b).
 fn hex_rgb(hex: &str) -> Option<(u8, u8, u8)> {
     let h = hex.trim().trim_start_matches('#');
@@ -185,6 +191,15 @@ impl TraySafety {
             _ => TraySafety::WatcherAbsent,
         }
     }
+
+    /// Whether a StatusNotifier host owns the watcher name, i.e. the tray
+    /// icon has somewhere to appear. Only [`TraySafety::WatcherAbsent`] means
+    /// no host; the other two both imply the watcher is up. Used to decide
+    /// whether hiding the window on close (close-to-tray) is safe: with no
+    /// host there is no icon to restore the window from.
+    fn host_present(self) -> bool {
+        !matches!(self, TraySafety::WatcherAbsent)
+    }
 }
 
 /// Shared, thread-safe state coordinating tray-icon rebuilds (see
@@ -282,6 +297,33 @@ fn is_hyprland() -> bool {
         || std::env::var("XDG_CURRENT_DESKTOP")
             .map(|d| d.to_lowercase().contains("hyprland"))
             .unwrap_or(false)
+}
+
+/// Whether the shared library the Linux tray backend dlopens is present.
+///
+/// `libappindicator-sys` `dlopen`s one of these sonames and **panics** from a
+/// `Lazy` initializer when none is found — which aborts the whole app during
+/// startup. Some runtimes ship WebKitGTK/GTK but no appindicator library (for
+/// example the Flatpak `org.gnome.Platform` runtime), so probe for it first
+/// and run tray-less there instead of crashing. The order mirrors
+/// `libappindicator-sys`: the Ayatana fork first, then the legacy library;
+/// the `.so.1` soname first, then the unversioned backcompat name.
+fn appindicator_available() -> bool {
+    const SONAMES: [&str; 4] = [
+        "libayatana-appindicator3.so.1",
+        "libappindicator3.so.1",
+        "libayatana-appindicator3.so",
+        "libappindicator3.so",
+    ];
+    for name in SONAMES {
+        if let Ok(lib) = unsafe { libloading::Library::new(name) } {
+            // Keep it loaded so the tray backend reuses this mapping rather
+            // than reloading (and so a later probe cannot unload it mid-use).
+            std::mem::forget(lib);
+            return true;
+        }
+    }
+    false
 }
 
 /// Create the tray icon with its menu and wire "Open Sufi Email" / "Quit",
@@ -473,6 +515,179 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// The window operations the size helpers need. Tauri's `Window` (delivered to
+/// window events) and `WebviewWindow` (returned by `get_webview_window`) expose
+/// the same methods but share no trait, so bridge them here to keep one code
+/// path for both.
+trait WindowGeometry {
+    fn geo_logical_inner_size(&self) -> Option<(u32, u32)>;
+    fn geo_is_maximized(&self) -> bool;
+    fn geo_is_fullscreen(&self) -> bool;
+    fn geo_monitor_bounds(&self) -> Option<(u32, u32)>;
+    fn geo_set_size(&self, width: u32, height: u32) -> tauri::Result<()>;
+}
+
+macro_rules! impl_window_geometry {
+    ($t:ty) => {
+        impl WindowGeometry for $t {
+            fn geo_logical_inner_size(&self) -> Option<(u32, u32)> {
+                let scale = self.scale_factor().unwrap_or(1.0);
+                let logical = self.inner_size().ok()?.to_logical::<u32>(scale);
+                Some((logical.width, logical.height))
+            }
+            fn geo_is_maximized(&self) -> bool {
+                self.is_maximized().unwrap_or(false)
+            }
+            fn geo_is_fullscreen(&self) -> bool {
+                self.is_fullscreen().unwrap_or(false)
+            }
+            fn geo_monitor_bounds(&self) -> Option<(u32, u32)> {
+                let monitor = self.current_monitor().ok().flatten()?;
+                let logical = monitor.size().to_logical::<u32>(monitor.scale_factor());
+                Some((logical.width, logical.height))
+            }
+            fn geo_set_size(&self, width: u32, height: u32) -> tauri::Result<()> {
+                self.set_size(tauri::LogicalSize::new(width as f64, height as f64))
+            }
+        }
+    };
+}
+impl_window_geometry!(tauri::Window);
+impl_window_geometry!(tauri::WebviewWindow);
+
+/// A remembered window size that has not appeared on screen yet. `desired` is
+/// the size we want to end up at; `last_request` is what we most recently
+/// asked `set_size` for, used to cancel any constant offset between the
+/// requested and the resulting size (Wayland/CSD can add a decorations delta,
+/// so asking for `desired` yields `desired + offset`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingWindowRestore {
+    desired: (u32, u32),
+    last_request: (u32, u32),
+    attempts: u8,
+    /// Give up after this instant, so a startup restore that never resolves
+    /// can't keep fighting a resize the user makes later.
+    deadline: std::time::Instant,
+}
+
+/// The window's current size in logical pixels, or `None` while it is
+/// maximized/fullscreen. Those sizes describe the screen, not a size the user
+/// chose, so they are not remembered (the last normal size is kept instead).
+fn savable_window_size<W: WindowGeometry>(window: &W) -> Option<(u32, u32)> {
+    if window.geo_is_maximized() || window.geo_is_fullscreen() {
+        return None;
+    }
+    window.geo_logical_inner_size()
+}
+
+/// Resize a window to a remembered size, clamped to the current monitor so a
+/// size saved on a larger display never opens bigger than the screen it
+/// reappears on.
+fn apply_saved_window_size<W: WindowGeometry>(window: &W, width: u32, height: u32) {
+    let (mut width, mut height) = (width, height);
+    if let Some((monitor_width, monitor_height)) = window.geo_monitor_bounds() {
+        width = width.min(monitor_width);
+        height = height.min(monitor_height);
+    }
+    if let Err(e) = window.geo_set_size(width, height) {
+        log::warn!("window: set_size({width}x{height}) failed: {e}");
+    }
+}
+
+/// The next `set_size` request that cancels whatever constant offset sits
+/// between the size we asked for (`last_request`) and the size we actually got
+/// (`actual`), aiming at `desired`. Pure so the correction is unit-testable.
+/// Clamped to a sane minimum so a wild report can't produce a degenerate
+/// window.
+fn corrected_request(
+    desired: (u32, u32),
+    last_request: (u32, u32),
+    actual: (u32, u32),
+) -> (u32, u32) {
+    let dx = actual.0 as i64 - last_request.0 as i64;
+    let dy = actual.1 as i64 - last_request.1 as i64;
+    (
+        (desired.0 as i64 - dx).max(200) as u32,
+        (desired.1 as i64 - dy).max(200) as u32,
+    )
+}
+
+/// What the pending-restore state machine wants done with an observed size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreStep {
+    /// No restore in progress: persist the size normally.
+    Idle,
+    /// The size matched the one being restored: persist normally.
+    Confirmed,
+    /// Ask the window for this size and keep the saved value for now.
+    Request((u32, u32)),
+    /// Ran out of attempts or time; give up on the desired size.
+    GaveUp((u32, u32)),
+}
+
+/// Advance the pending-restore state machine for one observed window size.
+/// Pure (no window access, no locking) so the confirm/retry/give-up behaviour
+/// is unit-testable; returns the new pending state and the action to take.
+fn restore_step(
+    pending: Option<PendingWindowRestore>,
+    current: (u32, u32),
+    now: std::time::Instant,
+) -> (Option<PendingWindowRestore>, RestoreStep) {
+    match pending {
+        None => (None, RestoreStep::Idle),
+        Some(p) if current == p.desired => (None, RestoreStep::Confirmed),
+        Some(p) if p.attempts > 0 && now <= p.deadline => {
+            let request = corrected_request(p.desired, p.last_request, current);
+            let next = PendingWindowRestore {
+                desired: p.desired,
+                last_request: request,
+                attempts: p.attempts - 1,
+                deadline: p.deadline,
+            };
+            (Some(next), RestoreStep::Request(request))
+        }
+        Some(p) => (None, RestoreStep::GaveUp(p.desired)),
+    }
+}
+
+/// Block until a size arrives, then keep absorbing sizes until the stream has
+/// been quiet for `quiet`, returning the last one seen. `None` once the sender
+/// is gone. This is the debounce behind the window-size writer, split out so
+/// it can be tested without a real window.
+fn coalesce_sizes(
+    rx: &std::sync::mpsc::Receiver<(u32, u32)>,
+    quiet: Duration,
+) -> Option<(u32, u32)> {
+    let (mut width, mut height) = rx.recv().ok()?;
+    loop {
+        match rx.recv_timeout(quiet) {
+            Ok((w, h)) => {
+                width = w;
+                height = h;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Some((width, height))
+}
+
+/// Persist the window size into `config.toml`. No-op when the value is
+/// unchanged, so the debounced resize writer does not rewrite the file on
+/// every quiet cycle.
+fn save_window_size(app: &tauri::AppHandle, width: u32, height: u32) {
+    let state = app.state::<AppState>();
+    let mut cfg = state.config.lock().unwrap();
+    let next = Some(account::WindowSize { width, height });
+    if cfg.window == next {
+        return;
+    }
+    cfg.window = next;
+    if let Err(e) = cfg.save() {
+        log::warn!("failed to save window size: {e}");
+    }
+}
+
 
 pub struct AppState {
     pub config: Mutex<Config>,
@@ -485,6 +700,11 @@ pub struct AppState {
     /// Coordinates tray-icon rebuilds around libayatana-appindicator's
     /// tooltip use-after-free (see `TraySafety`) and gates tray repaints.
     pub(crate) tray_guard: Arc<TrayGuard>,
+    /// A remembered window size that has not been confirmed on screen yet.
+    /// While set, resize events re-apply the target and are not persisted, so
+    /// the compositor's decorations-offset startup size cannot overwrite the
+    /// saved one.
+    pub(crate) pending_window_restore: Mutex<Option<PendingWindowRestore>>,
 }
 
 /// Fire the silent new-mail toast through the OS notification daemon.
@@ -1829,6 +2049,15 @@ fn main() {
             Err(e) => log::warn!("dedupe failed for {}: {e}", acc.email),
         }
     }
+
+    // Window-size persistence. Resize events arrive in a burst while the user
+    // drags, so a small worker coalesces them and writes config.toml once the
+    // drag stops. mpsc::Sender is Send but not Sync and on_window_event
+    // requires Sync, so the sender is wrapped in a Mutex (never contended —
+    // the handler only runs on the main thread).
+    let (window_size_tx, window_size_rx) = std::sync::mpsc::channel::<(u32, u32)>();
+    let window_size_tx = Mutex::new(window_size_tx);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1836,8 +2065,46 @@ fn main() {
             config: Mutex::new(config),
             idle_watchers: Mutex::new(HashMap::new()),
             tray_guard: Arc::new(TrayGuard::new()),
+            pending_window_restore: Mutex::new(None),
         })
-        .setup(|app| {
+        .setup(move |app| {
+            // Reopen at the remembered size. The window is created hidden
+            // (tauri.conf.json `visible: false`) and revealed at the end of
+            // setup, so it never flashes at the default size — or with a title
+            // bar that Hyprland is about to hide (see below).
+            let main_window = app.get_webview_window("main");
+            let saved_size = app.state::<AppState>().config.lock().unwrap().window;
+            if let (Some(window), Some(size)) = (main_window.as_ref(), saved_size) {
+                // Wayland can drop a resize requested before the window is
+                // mapped and then report a decorations-offset size. Mark the
+                // restore pending: the resize handler re-applies it until it
+                // sticks and refuses to persist anything until then.
+                *app
+                    .state::<AppState>()
+                    .pending_window_restore
+                    .lock()
+                    .unwrap() = Some(PendingWindowRestore {
+                    desired: (size.width, size.height),
+                    last_request: (size.width, size.height),
+                    attempts: WINDOW_RESTORE_ATTEMPTS,
+                    deadline: std::time::Instant::now() + Duration::from_secs(5),
+                });
+                apply_saved_window_size(window, size.width, size.height);
+            }
+
+            // Debounced window-size saver: keep the last size received and
+            // persist it once the stream of resize events goes quiet.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    while let Some((width, height)) =
+                        coalesce_sizes(&window_size_rx, Duration::from_millis(400))
+                    {
+                        save_window_size(&handle, width, height);
+                    }
+                });
+            }
+
             spawn_missing_idle_watchers(app.handle());
             // Follow the active Omarchy theme: repaint the UI live when the
             // theme changes (the watcher emits system-theme-changed).
@@ -1853,25 +2120,99 @@ fn main() {
             // bar there; other desktops keep it (the title bar is expected
             // on ordinary X11/Wayland desktops).
             if is_hyprland() {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = main_window.as_ref() {
                     match window.set_decorations(false) {
                         Ok(()) => log::info!("hidden window decorations (Hyprland)"),
                         Err(e) => log::warn!("could not hide window decorations: {e}"),
                     }
                 }
             }
-            setup_tray(app.handle())?;
-            update_tray_icon(app.handle());
+            // The Linux tray backend dlopens an appindicator library and
+            // panics if none is found, taking the app down at startup. That
+            // happens in sandboxed runtimes that ship WebKitGTK/GTK but not
+            // appindicator (e.g. the Flatpak GNOME runtime), so only build the
+            // tray when the library is actually there; otherwise run without
+            // it (closing the window then quits, see the close handler).
+            if appindicator_available() {
+                setup_tray(app.handle())?;
+                update_tray_icon(app.handle());
+            } else {
+                log::warn!(
+                    "no appindicator library found — running without a tray icon"
+                );
+            }
+            // Reveal the window. If the compositor ignored the pre-map resize,
+            // the resize handler re-applies the remembered size once the
+            // surface is mapped.
+            if let Some(window) = main_window.as_ref() {
+                let _ = window.show();
+            }
             Ok(())
         })
+        // Remember the window size across resizes, and ignore the sizes seen
+        // while maximized/fullscreen (see savable_window_size).
+        //
         // Close-to-tray: clicking the window's close button (or Super+W)
         // only hides the window; the app keeps running in the background
         // with the tray icon. Quit from the tray menu is the real exit.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+        //
+        // Only do this when a tray host is actually on the bus: on a desktop
+        // with no StatusNotifierWatcher (e.g. Fedora Workstation's default
+        // GNOME, which ships no AppIndicator extension) the icon is invisible,
+        // so hiding the window would strand the running app with no way back.
+        // There we fall through to a normal close, which quits. The signal is
+        // the same watcher state the tray code tracks: WatcherAbsent means no
+        // host. The watcher monitor samples within milliseconds of startup, so
+        // this reflects reality by the time a user can click close.
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::Resized(_) => {
+                let Some(current) = savable_window_size(window) else {
+                    return;
+                };
+                let state = window.state::<AppState>();
+                let step = {
+                    let mut pending = state.pending_window_restore.lock().unwrap();
+                    let (next, step) =
+                        restore_step(*pending, current, std::time::Instant::now());
+                    *pending = next;
+                    step
+                };
+                match step {
+                    RestoreStep::Request((width, height)) => {
+                        apply_saved_window_size(window, width, height);
+                        return;
+                    }
+                    RestoreStep::GaveUp((width, height)) => {
+                        log::warn!(
+                            "window: could not restore {width}x{height} (stuck at {}x{})",
+                            current.0,
+                            current.1
+                        );
+                    }
+                    RestoreStep::Idle | RestoreStep::Confirmed => {}
+                }
+                let _ = window_size_tx.lock().unwrap().send(current);
             }
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                let state = window.state::<AppState>();
+                // Don't persist a startup size we never managed to correct.
+                let restoring = state.pending_window_restore.lock().unwrap().is_some();
+                if !restoring {
+                    // Flush synchronously on the way out: the app may only be
+                    // hidden to the tray (or, with no tray host, actually quit),
+                    // so the debounced writer can't be relied on for the last
+                    // value.
+                    if let Some((width, height)) = savable_window_size(window) {
+                        save_window_size(window.app_handle(), width, height);
+                    }
+                }
+                let has_tray_host = state.tray_guard.safety().host_present();
+                if has_tray_host {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             get_accounts,
@@ -2080,6 +2421,17 @@ mod main_tests {
     }
 
     #[test]
+    fn tray_host_present_tracks_the_watcher() {
+        use super::TraySafety;
+        // No watcher -> no tray host -> close must not hide to tray.
+        assert!(!TraySafety::WatcherAbsent.host_present());
+        // Watcher up (whether or not the icon had to be rebuilt) -> a host is
+        // there to restore the window from, so hide-to-tray stays enabled.
+        assert!(TraySafety::RebuildPending.host_present());
+        assert!(TraySafety::Clean.host_present());
+    }
+
+    #[test]
     fn tray_safety_encodes_conservatively() {
         use super::TraySafety;
         for s in [
@@ -2105,6 +2457,146 @@ mod main_tests {
         // Same unread but the theme tint changed -> repaint (icon recolor).
         let recolored = super::TrayVisual { unread: 3, tint: (9, 9, 9) };
         assert!(super::needs_tray_repaint(Some(recolored), v));
+    }
+
+    // ---------------------------------------------------------------------
+    // Window-size restore correction (Wayland/CSD decorations offset)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn window_restore_correction_cancels_a_constant_offset() {
+        // Asked for 1105x874 but the window came back 52x99 bigger: the next
+        // request backs off by exactly that offset...
+        let desired = (1105u32, 874u32);
+        let request = super::corrected_request(desired, desired, (1157, 973));
+        assert_eq!(request, (1053, 775));
+        // ...so re-requesting lands on the desired size (one-step convergence).
+        assert_eq!((request.0 + 52, request.1 + 99), desired);
+    }
+
+    #[test]
+    fn window_restore_correction_is_a_noop_without_offset() {
+        assert_eq!(
+            super::corrected_request((800, 600), (800, 600), (800, 600)),
+            (800, 600)
+        );
+    }
+
+    #[test]
+    fn window_restore_correction_clamps_to_a_sane_minimum() {
+        assert_eq!(
+            super::corrected_request((800, 600), (800, 600), (5000, 5000)),
+            (200, 200)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Pending-restore state machine and resize debounce
+    // ---------------------------------------------------------------------
+
+    fn pending(desired: (u32, u32), attempts: u8) -> super::PendingWindowRestore {
+        super::PendingWindowRestore {
+            desired,
+            last_request: desired,
+            attempts,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn restore_step_is_idle_without_pending() {
+        use super::RestoreStep;
+        let (next, step) = super::restore_step(None, (1000, 700), std::time::Instant::now());
+        assert_eq!(step, RestoreStep::Idle);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn restore_step_confirms_when_the_size_matches() {
+        use super::RestoreStep;
+        let desired = (1105u32, 874u32);
+        let (next, step) =
+            super::restore_step(Some(pending(desired, 5)), desired, std::time::Instant::now());
+        assert_eq!(step, RestoreStep::Confirmed);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn restore_step_retries_with_the_corrected_request_then_confirms() {
+        use super::RestoreStep;
+        let desired = (1105u32, 874u32);
+        // The window came back 52x99 bigger.
+        let (next, step) = super::restore_step(
+            Some(pending(desired, 5)),
+            (1157, 973),
+            std::time::Instant::now(),
+        );
+        assert_eq!(step, RestoreStep::Request((1053, 775)));
+        let next = next.expect("still pending");
+        assert_eq!(next.attempts, 4);
+        // The window honors the correction: asking for 1053x775 with the same
+        // +52/+99 offset comes back as exactly the desired 1105x874, which
+        // confirms the restore.
+        let (after, step) =
+            super::restore_step(Some(next), desired, std::time::Instant::now());
+        assert_eq!(step, RestoreStep::Confirmed);
+        assert!(after.is_none());
+    }
+
+    #[test]
+    fn restore_step_gives_up_after_attempts_or_deadline() {
+        use super::RestoreStep;
+        let now = std::time::Instant::now();
+        // Attempts exhausted.
+        assert_eq!(
+            super::restore_step(Some(pending((900, 700), 0)), (1280, 800), now).1,
+            RestoreStep::GaveUp((900, 700))
+        );
+        // Deadline passed.
+        let mut expired = pending((900, 700), 5);
+        expired.deadline = now - std::time::Duration::from_secs(1);
+        let (next, step) = super::restore_step(Some(expired), (1280, 800), now);
+        assert_eq!(step, RestoreStep::GaveUp((900, 700)));
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn coalesce_returns_the_last_size_of_a_burst() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for size in [(1, 1), (2, 2), (3, 3)] {
+            tx.send(size).unwrap();
+        }
+        drop(tx);
+        assert_eq!(
+            super::coalesce_sizes(&rx, std::time::Duration::from_millis(50)),
+            Some((3, 3))
+        );
+    }
+
+    #[test]
+    fn coalesce_returns_none_when_the_channel_is_closed() {
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, u32)>();
+        drop(tx);
+        assert_eq!(
+            super::coalesce_sizes(&rx, std::time::Duration::from_millis(50)),
+            None
+        );
+    }
+
+    #[test]
+    fn coalesce_ends_a_batch_at_the_quiet_gap() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((10, 10)).unwrap();
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = tx2.send((20, 20));
+        });
+        let quiet = std::time::Duration::from_millis(50);
+        // The first batch ends at the quiet gap...
+        assert_eq!(super::coalesce_sizes(&rx, quiet), Some((10, 10)));
+        // ...and the later size is its own batch.
+        assert_eq!(super::coalesce_sizes(&rx, quiet), Some((20, 20)));
     }
 }
 

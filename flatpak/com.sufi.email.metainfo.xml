@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.sufi.email</id>
+  <launchable type="desktop-id">com.sufi.email.desktop</launchable>
+  <name>Sufi Email</name>
+  <summary>Lightweight IMAP/SMTP email client</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- TODO: set the application's real license before publishing to Flathub. -->
+  <project_license>LicenseRef-proprietary</project_license>
+  <description>
+    <p>
+      Sufi Email is a lightweight, configurable email client built with Rust
+      and Tauri. It connects to standard IMAP/SMTP accounts, fetches mail and
+      sends messages, and keeps a local cache so folders, messages, bodies and
+      attachments stay readable offline.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Conversation threading and a three-column reading UI</li>
+      <li>HTML and plain-text rendering in a sandboxed frame</li>
+      <li>Attachments: download, inline previews, and attaching when composing</li>
+      <li>New-mail notifications and a system tray</li>
+      <li>Multiple accounts and an offline read/unread queue</li>
+    </ul>
+  </description>
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+  <keywords>
+    <keyword>email</keyword>
+    <keyword>mail</keyword>
+    <keyword>imap</keyword>
+    <keyword>smtp</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-06">
+      <description><p>Initial release.</p></description>
+    </release>
+  </releases>
+</component>

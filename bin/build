@@ -2,14 +2,17 @@
 # Build the standalone desktop application.
 #
 # Runs the full Tauri build: frontend (vite) + release Rust binary, then
-# produces the distributable bundles (AppImage/deb on Linux; icons come
-# from src-tauri/tauri.linux.conf.json). The standalone binary lands in
+# produces the bundles selected by src-tauri/tauri.linux.conf.json (a deb by
+# default, overridable with --bundles). The standalone binary lands in
 # src-tauri/target/release/sufi-email.
 #
+# For a Flatpak, use bin/flatpak (it builds this binary and packages it).
+#
 # Usage:
-#   bin/build                  # standard release build + bundles
+#   bin/build                  # release build + the configured bundle (deb)
 #   bin/build --no-bundle      # build the release binary without bundling
-#   bin/build --bundles deb    # only the deb package
+#   bin/build --bundles deb    # pick specific bundle(s)
+#   bin/build --bundles rpm    # e.g. an rpm
 #   bin/build -- --no-bundle   # a leading "--" is accepted and stripped
 
 set -euo pipefail
@@ -17,12 +20,25 @@ set -euo pipefail
 # Project root = one directory above this script's location (bin/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Make the system pkg-config files visible to the toolchain. On this
-# machine the pkg-config on PATH is Homebrew's, which only searches
-# Homebrew's own directories — tauri-cli's build-time tray check
-# (ayatana-appindicator) and the GTK stack would fail without the system
-# dirs on the path.
-export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}/home/linuxbrew/.linuxbrew/lib/pkgconfig:/home/linuxbrew/.linuxbrew/share/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig"
+# Make the system pkg-config files visible to the toolchain. Homebrew's
+# pkg-config is often first on PATH (on Omarchy, and on a Fedora box with
+# Linuxbrew) and only searches Homebrew's own prefixes, so the system dirs are
+# added explicitly — tauri-cli's bundle-time tray check (appindicator3-0.1 /
+# ayatana-appindicator3-0.1) and the GTK stack fail to resolve without them.
+# Both /usr/lib and /usr/lib64 are included so this works on Arch and
+# multiarch Debian (.pc under /usr/lib) as well as Fedora/RHEL x86_64
+# (.pc under /usr/lib64). Nonexistent dirs are skipped.
+for pcdir in \
+  /home/linuxbrew/.linuxbrew/lib/pkgconfig \
+  /home/linuxbrew/.linuxbrew/share/pkgconfig \
+  /usr/lib64/pkgconfig \
+  /usr/lib/pkgconfig \
+  /usr/share/pkgconfig; do
+  if [ -d "$pcdir" ]; then
+    PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$pcdir"
+  fi
+done
+export PKG_CONFIG_PATH
 
 # The tauri CLI ships as an npm devDependency (@tauri-apps/cli).
 if [ ! -x "$ROOT/node_modules/.bin/tauri" ]; then
@@ -39,6 +55,10 @@ for a in "$@"; do
   ARGS+=("$a")
 done
 
-echo "==> Building standalone app: npm run tauri build ${ARGS[*]}"
+echo "==> Building standalone app: tauri build ${ARGS[*]}"
 cd "$ROOT"
-exec npm run tauri build "${ARGS[@]}"
+# Invoke the tauri CLI binary directly rather than through `npm run tauri`:
+# npm consumes leading-dash arguments as its own options, so `--bundles rpm`
+# would reach tauri as a stray positional ("unexpected argument 'rpm' found").
+# The direct binary has no such ambiguity.
+exec "$ROOT/node_modules/.bin/tauri" build "${ARGS[@]}"

@@ -10,7 +10,8 @@
 #     leftovers (~/.local/share/bin, ~/.local/share/share/...) that the
 #     pre-fork-bomb-fix bin/install could write.
 #   * A system package if one is installed (sufi-email via dpkg on
-#     Debian/Ubuntu-family, or pacman for a debtap-converted Arch build).
+#     Debian/Ubuntu-family, pacman for a debtap-converted Arch build, or rpm
+#     on Fedora/RHEL).
 #   * Runtime data and caches: the start log (~/.cache/sufi-email), the
 #     WebKitGTK webview data dir (~/.local/share/com.sufi.email), and the
 #     account/mail-store dir (~/.config/sufi-email) — accounts, the
@@ -111,6 +112,8 @@ if have dpkg-query && dpkg-query -W sufi-email >/dev/null 2>&1; then
   pkg_cmd=(as_root dpkg -r sufi-email)
 elif have pacman && pacman -Q sufi-email >/dev/null 2>&1; then
   pkg_cmd=(as_root pacman -R --noconfirm sufi-email)
+elif have rpm && rpm -q sufi-email >/dev/null 2>&1; then
+  pkg_cmd=(as_root rpm -e sufi-email)
 fi
 
 # ---------------------------------------------------------------------------

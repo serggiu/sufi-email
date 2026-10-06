@@ -4250,6 +4250,7 @@ dependencies = [
  "imap",
  "imap-proto",
  "lettre",
+ "libloading",
  "log",
  "mail-parser",
  "notify-rust",

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sufi Email
+Comment=Lightweight IMAP/SMTP email client
+Exec=sufi-email
+Icon=com.sufi.email
+Terminal=false
+Categories=Network;Email;
+Keywords=email;imap;smtp;mail;
+StartupNotify=true
+StartupWMClass=sufi-email

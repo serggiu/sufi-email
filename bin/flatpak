@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Build (and optionally install) a Flatpak of Sufi Email.
+#
+# The Flatpak packages the self-contained release binary together with the app
+# icons and desktop metadata; the GNOME runtime supplies WebKitGTK 4.1 and
+# GTK 3. See flatpak/com.sufi.email.yml.
+#
+# One-time prerequisites:
+#   sudo dnf install flatpak-builder        # or apt/pacman equivalent
+#   flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50
+#
+# Usage:
+#   bin/flatpak               # rebuild the app + build/install the Flatpak
+#   bin/flatpak --run         # ... then launch it
+#   bin/flatpak --build-only  # build + export to a local repo, don't install
+#   bin/flatpak --no-build    # package the existing release binary as-is
+
+set -euo pipefail
+
+# Project root = one directory above this script's location (bin/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+FLATPAK_DIR="$ROOT/flatpak"
+MANIFEST="$FLATPAK_DIR/com.sufi.email.yml"
+SOURCES="$FLATPAK_DIR/sources"
+BUILD_DIR="$FLATPAK_DIR/build"
+REPO_DIR="$FLATPAK_DIR/repo"
+APP_ID="com.sufi.email"
+BIN="$ROOT/src-tauri/target/release/sufi-email"
+
+RUN=0
+BUILD_ONLY=0
+NO_BUILD=0
+for a in "$@"; do
+  case "$a" in
+    --run)        RUN=1 ;;
+    --build-only) BUILD_ONLY=1 ;;
+    --no-build)   NO_BUILD=1 ;;
+    *) echo "error: unknown argument: $a (expected --run, --build-only, --no-build)" >&2; exit 1 ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+say() { printf '==> %s\n' "$*" ; }
+
+# The coreutils copy tool is also named `install` — exactly like bin/install in
+# this repo — and this repo's bin/ can sit on PATH ahead of /usr/bin. A bare
+# `install` would then re-exec bin/install forever with the copy arguments (a
+# fork bomb). Pin the real binary explicitly, as bin/install does.
+if [ -x /usr/bin/install ]; then
+  INSTALL_BIN=/usr/bin/install
+elif [ -x /bin/install ]; then
+  INSTALL_BIN=/bin/install
+else
+  echo "error: coreutils 'install' not found — can't stage Flatpak sources" >&2
+  exit 1
+fi
+
+have flatpak-builder || {
+  echo "error: flatpak-builder is not installed" >&2
+  echo "       install it first, e.g. 'sudo dnf install flatpak-builder'" >&2
+  exit 1
+}
+
+# The manifest pins a GNOME runtime; make sure the runtime and its SDK (needed
+# by flatpak-builder) are available before we start a long build.
+RUNTIME_VER="$(awk -F"'" '/^runtime-version:/ {print $2}' "$MANIFEST" | head -1)"
+if [ -n "$RUNTIME_VER" ]; then
+  missing=0
+  for ref in "org.gnome.Platform//$RUNTIME_VER" "org.gnome.Sdk//$RUNTIME_VER"; do
+    if ! flatpak info "$ref" >/dev/null 2>&1; then
+      echo "error: Flatpak runtime '$ref' is not installed" >&2
+      missing=1
+    fi
+  done
+  if [ "$missing" -eq 1 ]; then
+    echo "       install with: flatpak install flathub org.gnome.Platform//$RUNTIME_VER org.gnome.Sdk//$RUNTIME_VER" >&2
+    exit 1
+  fi
+fi
+
+# The Flatpak packages a prebuilt binary. Rebuild it every time so the
+# packaged app always matches the current sources (cargo is incremental, so
+# this is cheap when nothing changed); packaging a stale binary is a nasty
+# surprise — exactly the "my changes didn't take effect" trap. Pass --no-build
+# to package whatever is already there.
+if [ "$NO_BUILD" -eq 0 ]; then
+  say "building the release binary (bin/build --no-bundle)"
+  "$ROOT/bin/build" --no-bundle
+fi
+if [ ! -x "$BIN" ]; then
+  echo "error: release binary missing: $BIN" >&2
+  echo "       drop --no-build so it can be built" >&2
+  exit 1
+fi
+
+# Stage the sources the manifest references (kept out of git).
+say "staging Flatpak sources"
+rm -rf "$SOURCES"
+mkdir -p "$SOURCES"
+"$INSTALL_BIN" -m 0755 "$BIN" "$SOURCES/sufi-email"
+"$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/32x32.png" "$SOURCES/32x32.png"
+"$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/128x128.png" "$SOURCES/128x128.png"
+"$INSTALL_BIN" -m 0644 "$ROOT/src-tauri/icons/icon.png" "$SOURCES/icon.png"
+
+if [ "$BUILD_ONLY" -eq 1 ]; then
+  say "building Flatpak and exporting to $REPO_DIR"
+  rm -rf "$REPO_DIR"
+  flatpak-builder --user --force-clean --repo="$REPO_DIR" "$BUILD_DIR" "$MANIFEST"
+  echo "  Install it with: flatpak --user install --reinstall $REPO_DIR $APP_ID"
+else
+  say "building and installing Flatpak (user installation)"
+  flatpak-builder --user --force-clean --install "$BUILD_DIR" "$MANIFEST"
+  echo "  Installed. Run with: flatpak run $APP_ID"
+fi
+
+if [ "$RUN" -eq 1 ]; then
+  say "launching $APP_ID"
+  flatpak run "$APP_ID"
+fi

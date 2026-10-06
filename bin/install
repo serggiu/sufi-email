@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the built Sufi Email app on this machine.
 #
-# Expects a bundle from a previous `bin/build` (the .deb in
+# Expects a bundle from a previous `bin/build` (the .deb and/or .rpm in
 # src-tauri/target/release/bundle/). Chooses the best install route for the
 # current distribution:
 #
@@ -15,8 +15,8 @@
 #   * Debian/Ubuntu-family: `apt-get install ./…deb` (or dpkg -i + apt -f).
 #   * Arch-family WITH debtap installed: converts the .deb to a pacman
 #     package and installs it system-wide (untested — needs debtap).
-#   * Fedora/RHEL-family: needs a .rpm bundle (not built by default), so it
-#     falls through to the user-local install too.
+#   * Fedora/RHEL-family: `dnf install ./…rpm` (bin/build produces the rpm on
+#     Fedora). Without an rpm it falls through to the user-local install.
 #
 # The non-local branches are written but can't be exercised on this machine.
 #

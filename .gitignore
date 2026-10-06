@@ -1,3 +1,9 @@
 target/
 node_modules/
 dist/
+
+# Flatpak build artifacts (bin/flatpak stages sources and builds here).
+flatpak/sources/
+flatpak/build/
+flatpak/repo/
+.flatpak-builder/
