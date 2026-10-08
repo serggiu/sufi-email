@@ -299,6 +299,61 @@ fn is_hyprland() -> bool {
             .unwrap_or(false)
 }
 
+/// Realign the client-side title bar's buttons with the desktop's configured
+/// layout.
+///
+/// On Wayland tao gives every window its own title bar — a stock
+/// `GtkHeaderBar` — and pins its button layout to the literal
+/// `"menu:minimize,maximize,close"`. That overrides the desktop's
+/// `gtk-decoration-layout` setting (on Fedora/GNOME it is
+/// `"menu:minimize,close"`), so the window sprouts a Maximize button the rest
+/// of the desktop does not show and looks out of place.
+///
+/// Clearing the header bar's layout hands the choice back to GTK, which then
+/// reads `gtk-decoration-layout` — the same setting every other GTK app
+/// honours — and keeps following it if the user rearranges the buttons. It is
+/// a no-op on X11, where GTK leaves decorations to the window manager (which
+/// already follows the setting), and wherever tao installed no title bar.
+#[cfg(target_os = "linux")]
+fn adopt_system_decoration_layout(window: &tauri::WebviewWindow) {
+    use gtk::prelude::*;
+
+    let Ok(gtk_window) = window.gtk_window() else {
+        return;
+    };
+    let Some(titlebar) = gtk_window.titlebar() else {
+        return;
+    };
+    match find_header_bar(&titlebar) {
+        Some(header) => {
+            // A NULL layout sets decoration-layout-set = FALSE, which makes the
+            // header bar fall back to the gtk-decoration-layout setting (see
+            // gtk_header_bar_set_decoration_layout).
+            header.set_decoration_layout(None);
+            log::info!("title bar now follows the system decoration layout");
+        }
+        None => log::debug!("no client-side title bar to adjust"),
+    }
+}
+
+/// The first `GtkHeaderBar` in `widget`'s subtree (inclusive), if any. tao
+/// wraps its header bar in a `GtkEventBox`, so it is reached by descending
+/// through the title bar's children rather than assumed to be the direct
+/// child.
+#[cfg(target_os = "linux")]
+fn find_header_bar(widget: &gtk::Widget) -> Option<gtk::HeaderBar> {
+    use gtk::prelude::*;
+
+    if let Some(header) = widget.downcast_ref::<gtk::HeaderBar>() {
+        return Some(header.clone());
+    }
+    widget
+        .downcast_ref::<gtk::Container>()?
+        .children()
+        .iter()
+        .find_map(find_header_bar)
+}
+
 /// Whether the shared library the Linux tray backend dlopens is present.
 ///
 /// `libappindicator-sys` `dlopen`s one of these sonames and **panics** from a
@@ -2125,6 +2180,15 @@ fn main() {
                         Ok(()) => log::info!("hidden window decorations (Hyprland)"),
                         Err(e) => log::warn!("could not hide window decorations: {e}"),
                     }
+                }
+            } else {
+                // Everywhere else the title bar stays, but on Wayland tao
+                // hardcodes its button layout; realign it with the desktop's
+                // configured one so the buttons match other apps (no stray
+                // Maximize on Fedora/GNOME).
+                #[cfg(target_os = "linux")]
+                if let Some(window) = main_window.as_ref() {
+                    adopt_system_decoration_layout(window);
                 }
             }
             // The Linux tray backend dlopens an appindicator library and

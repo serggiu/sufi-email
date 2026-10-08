@@ -4246,6 +4246,7 @@ dependencies = [
  "env_logger",
  "getrandom 0.4.3",
  "glib",
+ "gtk",
  "image",
  "imap",
  "imap-proto",

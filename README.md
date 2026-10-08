@@ -3,6 +3,9 @@
 A lightweight, configurable email client built with Rust + Tauri. Connects to
 standard IMAP/SMTP accounts, fetches mail, and sends messages.
 
+Built on Omarchy (Arch) and ported to Fedora, where it is packaged and run as a
+Flatpak. It also builds as a `.deb`/`.rpm` or a bare binary.
+
 ## Icon & artwork credit
 
 The app icon is adapted from **"Semakar"** — whirling-dervish line art by
@@ -20,6 +23,10 @@ The app icon is adapted from **"Semakar"** — whirling-dervish line art by
 - **Remembers the window size**: resizes are saved and the app reopens at the
   size you last left it at (maximized/fullscreen sizes are ignored, so a
   window that fits returns to its normal size)
+- **Title bar matches the desktop**: the window buttons follow the system's
+  decoration layout, so e.g. Fedora/GNOME shows just minimize + close instead
+  of an extra Maximize button; on Hyprland/Omarchy the title bar is hidden
+  altogether, as before
 - **Conversation threading**: one row per thread (newest subject/from/snippet,
   message count, unread badge); the preview pane and a double-click modal
   show the full discussion newest-first; replies automatically join the thread
@@ -159,9 +166,11 @@ detects at build time), so `dnf` pulls them in.
 
 ### Flatpak
 
-`bin/flatpak` packages the release binary as a Flatpak (per-user install). It
-rebuilds the binary on every run so the packaged app always matches the
-sources (`--no-build` skips that):
+`bin/flatpak` packages the release binary as a Flatpak (per-user install). This
+is the supported way to run Sufi Email on Fedora, and the packaging has been
+built and validated end to end there (Fedora 44 with GNOME Shell 50 on Wayland,
+Flatpak 1.18). It rebuilds the binary on every run so the packaged app always
+matches the sources (`--no-build` skips that):
 
 ```sh
 bin/flatpak                # rebuild the app + build/install for the current user
@@ -255,6 +264,7 @@ distros where it is supported.
 - [x] Inline image previews (thumbnails + embedded images)
 - [x] New-mail notifications (IDLE push + desktop toasts)
 - [x] Offline cache + queued read/unread sync
+- [x] Flatpak packaging for Fedora (GNOME runtime)
 - [ ] Google OAuth account support (Gmail API / XOAUTH2)
 - [ ] Full-text message search
 - [ ] Message filters/rules (auto-move, auto-archive)
