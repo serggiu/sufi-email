@@ -561,7 +561,7 @@ fn spawn_tray_watcher_monitor(app: tauri::AppHandle, tray_guard: Arc<TrayGuard>)
 }
 
 /// Show and focus the main window (used by the tray's left-click and the
-/// "Open Sufi Email" menu item).
+/// "Open Sufi Email" menu item, and by clicking a new-mail notification).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -762,11 +762,27 @@ pub struct AppState {
     pub(crate) pending_window_restore: Mutex<Option<PendingWindowRestore>>,
 }
 
+/// The basename (without `.desktop`) of the installed desktop file, for the
+/// notification's `desktop-entry` hint. The Flatpak exports the app id
+/// (`com.sufi.email.desktop`, exposed as `FLATPAK_ID`); the `.deb`/`.rpm` and
+/// source installs export `sufi-email.desktop`. GNOME uses the hint to
+/// attribute the toast to the app (its name and icon); an unknown value just
+/// falls back to a generic icon, so this is a best-effort cosmetic hint.
+fn notification_desktop_entry() -> String {
+    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "sufi-email".to_string())
+}
+
 /// Fire the silent new-mail toast through the OS notification daemon.
 /// Visual only: no sound hint is set (the freedesktop spec is silent by
 /// default; `.silent()` makes that explicit on platforms that support it).
 /// Shows the sender and subject when available; `extra` is the number of
 /// additional new messages beyond the one described.
+///
+/// The desktop-entry hint (see [`notification_desktop_entry`]) names the
+/// installed desktop file so the desktop attributes the toast to the app
+/// instead of showing a generic icon.
+///
+/// Clicking the toast raises the main window (see [`show_main_window`]).
 ///
 /// Runs on a plain detached thread on purpose: notify-rust's zbus blocking
 /// path must not run on a tokio worker thread. With the tokio feature
@@ -776,7 +792,7 @@ pub struct AppState {
 /// already inside tauri's async runtime — which is exactly where the
 /// notification plugin's internal spawn used to run `show()`, silently
 /// killing every new-mail toast.
-fn fire_new_mail_notification(from: &str, subject: &str, extra: usize) {
+fn fire_new_mail_notification(app: &tauri::AppHandle, from: &str, subject: &str, extra: usize) {
     let title = if from.is_empty() {
         "New email".to_string()
     } else {
@@ -790,14 +806,31 @@ fn fire_new_mail_notification(from: &str, subject: &str, extra: usize) {
     if extra > 0 {
         body.push_str(&format!("  (+{extra} more)"));
     }
+    let app = app.clone();
     std::thread::spawn(move || {
-        if let Err(e) = notify_rust::Notification::new()
-            .appname("sufi-email")
+        let shown = notify_rust::Notification::new()
+            .appname("Sufi Email")
+            .hint(notify_rust::Hint::DesktopEntry(notification_desktop_entry()))
+            // "default" is the action a click on the toast body invokes (GNOME
+            // and other daemons fire it); we raise the window in response.
+            .action("default", "Open")
             .summary(&title)
             .body(&body)
-            .show()
-        {
-            log::warn!("new-mail notification failed: {e}");
+            .show();
+        match shown {
+            // Blocks this thread until the toast is clicked or dismissed;
+            // clicking ("default") raises the main window on the UI thread,
+            // and the dismissed ("__closed") and any other response are
+            // ignored.
+            Ok(handle) => handle.wait_for_action(move |action| {
+                if action == "default" {
+                    let target = app.clone();
+                    if let Err(e) = app.run_on_main_thread(move || show_main_window(&target)) {
+                        log::warn!("could not focus the window from the notification: {e}");
+                    }
+                }
+            }),
+            Err(e) => log::warn!("new-mail notification failed: {e}"),
         }
     });
 }
@@ -1897,7 +1930,7 @@ fn slow_poll_account(app: &tauri::AppHandle, acc: &AccountConfig, stop: Arc<Atom
                     // sender/subject can come from the stored summaries.
                     warm_inbox_cache(acc, &inbox);
                     let (from, subject, extra) = cached_preview(acc, &inbox, &new);
-                    fire_new_mail_notification(&from, &subject, extra);
+                    fire_new_mail_notification(app, &from, &subject, extra);
                 }
                 flush_pending_flags(app);
                 // Keep the tray icon truthful from the backend: store the
@@ -2052,7 +2085,7 @@ fn process_inbox_change(
         let newest = *new.iter().max().unwrap_or(&0);
         let (from, subject) =
             mail::fetch_envelope_preview(session, newest).unwrap_or_default();
-        fire_new_mail_notification(&from, &subject, new.len() - 1);
+        fire_new_mail_notification(app, &from, &subject, new.len() - 1);
         // Warm the INBOX cache so the message is already in the list when
         // the user opens/refreshes it — the toast should not beat the
         // message.
@@ -2391,6 +2424,25 @@ mod main_tests {
         match prev_desk {
             Some(v) => std::env::set_var("XDG_CURRENT_DESKTOP", v),
             None => std::env::remove_var("XDG_CURRENT_DESKTOP"),
+        }
+    }
+
+    #[test]
+    fn notification_desktop_entry_follows_the_install_method() {
+        let prev = std::env::var_os("FLATPAK_ID");
+
+        // Source/.deb/.rpm installs export "sufi-email.desktop".
+        std::env::remove_var("FLATPAK_ID");
+        assert_eq!(super::notification_desktop_entry(), "sufi-email");
+
+        // Inside a Flatpak, the exported desktop file is named after the app
+        // id (which Flatpak exposes as FLATPAK_ID).
+        std::env::set_var("FLATPAK_ID", "com.sufi.email");
+        assert_eq!(super::notification_desktop_entry(), "com.sufi.email");
+
+        match prev {
+            Some(v) => std::env::set_var("FLATPAK_ID", v),
+            None => std::env::remove_var("FLATPAK_ID"),
         }
     }
     // ---------------------------------------------------------------------

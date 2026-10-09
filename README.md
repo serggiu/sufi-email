@@ -37,8 +37,8 @@ The app icon is adapted from **"Semakar"** — whirling-dervish line art by
   (cid:) images rendered inside the message body, and attaching files when
   composing (sent as multipart/mixed)
 - **New-mail notifications**: instant IMAP IDLE push detection with desktop
-  toasts (sender + subject); moves into Inbox don't produce false "new email"
-  toasts
+  toasts (sender + subject) that open the app when clicked; moves into Inbox
+  don't produce false "new email" toasts
 - **Offline support**: folders, message lists, bodies and attachment previews
   all read from a local cache first; read/unread changes made while offline
   are queued and flushed when the connection returns
